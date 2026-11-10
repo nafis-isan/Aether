@@ -127,6 +127,9 @@ async def send_chat_message(
             "messages": model_messages,
             "memories": [memory.content for memory in memories],
             "step_count": 0,
+            "model_calls": 0,
+            "tool_calls": 0,
+            "reported_cost_usd": 0.0,
         },
     )
     run.state_snapshot["run_id"] = run.id
@@ -142,6 +145,9 @@ async def send_chat_message(
         "messages": model_messages,
         "memories": [memory.content for memory in memories],
         "step_count": 0,
+        "model_calls": 0,
+        "tool_calls": 0,
+        "reported_cost_usd": 0.0,
     }
     await emit_event(
         session,
@@ -176,9 +182,16 @@ async def send_chat_message(
     conversation.updated_at = datetime.now(timezone.utc)
     session.add(assistant_message)
     is_waiting_approval = completion.get("pending_approval_id") is not None
-    run.status = "waiting_approval" if is_waiting_approval else "completed"
+    is_cancelled = bool(completion.get("cancelled"))
+    is_limited = bool(completion.get("limit_reached"))
+    run.status = (
+        "waiting_approval" if is_waiting_approval else
+        "cancelled" if is_cancelled else
+        "limit_reached" if is_limited else
+        "completed"
+    )
     await session.commit()
-    if not is_waiting_approval:
+    if not is_waiting_approval and not is_cancelled and not is_limited:
         await emit_event(
             session,
             run_id=run.id,
@@ -200,6 +213,36 @@ async def send_chat_message(
         selected_agent=completion["selected_agent"],
         pending_approval_id=completion.get("pending_approval_id"),
     )
+
+
+@router.post("/agents/runs/{run_id}/stop", status_code=status.HTTP_202_ACCEPTED)
+async def stop_agent_run(
+    run_id: str,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    result = await session.execute(
+        select(AgentRun)
+        .where(AgentRun.id == run_id, AgentRun.user_id == user.id)
+        .with_for_update()
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
+    if run.status == "cancel_requested":
+        return {"status": "cancel_requested"}
+    if run.status != "running":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent run is not running")
+    run.status = "cancel_requested"
+    await session.commit()
+    await emit_event(
+        session,
+        run_id=run.id,
+        agent_name="aether_core",
+        event_type="workflow.stop_requested",
+        payload={"status": "cancel_requested"},
+    )
+    return {"status": "cancel_requested"}
 
 
 @router.get("/conversations", response_model=list[ConversationRead])
@@ -323,6 +366,7 @@ async def resume_agent_run(
         if pending_state:
             approval_result = await session.execute(
                 select(Approval).where(
+                    Approval.id == pending_state.get("pending_approval_id"),
                     Approval.agent_run_id == run.id,
                     Approval.status == "approved",
                 )
@@ -357,7 +401,7 @@ async def resume_agent_run(
                     )
                 approved_state = {
                     **pending_state,
-                    "messages": [
+                    "resume_messages": [
                         *continuation_messages,
                         {
                             "role": "tool",
@@ -365,20 +409,61 @@ async def resume_agent_run(
                             "content": json.dumps(execution.output_data, ensure_ascii=True),
                         },
                     ],
-                    "step_count": pending_state.get("step_count", 0) + 1,
                 }
+                approved_state.pop("pending_approval_id", None)
+                approved_state.pop("pending_tool_call", None)
+                approved_state.pop("continuation_messages", None)
 
         if approved_state is not None:
             state = approved_state
         else:
-            checkpoint_result = await session.execute(
+            worker_checkpoint_result = await session.execute(
                 select(AgentCheckpoint).where(
                     AgentCheckpoint.agent_run_id == run.id,
                     AgentCheckpoint.checkpoint_key == "worker-start",
                 )
             )
-            checkpoint = checkpoint_result.scalar_one_or_none()
-            state = checkpoint.state_data if checkpoint is not None else run.state_snapshot
+            worker_checkpoint = worker_checkpoint_result.scalar_one_or_none()
+            progress_checkpoint_result = await session.execute(
+                select(AgentCheckpoint).where(
+                    AgentCheckpoint.agent_run_id == run.id,
+                    AgentCheckpoint.checkpoint_key == "tool-progress",
+                )
+            )
+            progress_checkpoint = progress_checkpoint_result.scalar_one_or_none()
+            budget_checkpoint_result = await session.execute(
+                select(AgentCheckpoint).where(
+                    AgentCheckpoint.agent_run_id == run.id,
+                    AgentCheckpoint.checkpoint_key == "workflow-budget",
+                )
+            )
+            budget_checkpoint = budget_checkpoint_result.scalar_one_or_none()
+            worker_state = worker_checkpoint.state_data if worker_checkpoint is not None else None
+            progress_state = progress_checkpoint.state_data if progress_checkpoint is not None else None
+            budget_state = budget_checkpoint.state_data if budget_checkpoint is not None else None
+            completed_steps_result = await session.execute(
+                select(AgentCheckpoint).where(
+                    AgentCheckpoint.agent_run_id == run.id,
+                    AgentCheckpoint.checkpoint_key.like("plan-step-%-completed"),
+                )
+            )
+            candidates = [
+                (worker_state, 1),
+                (progress_state, 2),
+                (budget_state, 4),
+                *[
+                    (item.state_data, 3)
+                    for item in completed_steps_result.scalars().all()
+                ],
+            ]
+            resumable_states = [(item, priority) for item, priority in candidates if item is not None]
+            if resumable_states:
+                state = max(
+                    resumable_states,
+                    key=lambda item: (item[0].get("step_index", 0), item[1]),
+                )[0]
+            else:
+                state = run.state_snapshot
         if not state or not state.get("messages"):
             history_result = await session.execute(
                 select(Message)
@@ -425,43 +510,61 @@ async def resume_agent_run(
             Message.role == "assistant",
         )
     )
-    already_saved = any(
-        message.metadata_json and message.metadata_json.get("agent_run_id") == run.id
-        for message in existing_messages.scalars().all()
+    assistant_message = next(
+        (
+            message
+            for message in existing_messages.scalars().all()
+            if message.metadata_json and message.metadata_json.get("agent_run_id") == run.id
+        ),
+        None,
     )
     now = datetime.now(timezone.utc)
-    if not already_saved:
-        session.add(
-            Message(
-                id=str(uuid4()),
-                conversation_id=conversation.id,
-                role="assistant",
-                content=completed_state["answer"],
-                metadata_json={
-                    "model": completed_state["model_id"],
-                    "reasoning_details": completed_state.get("reasoning_details"),
-                    "usage": completed_state.get("usage"),
-                    "agent": completed_state["selected_agent"],
-                    "agent_run_id": run.id,
-                },
-                created_at=now,
-            )
+    metadata = {
+        "model": completed_state["model_id"],
+        "reasoning_details": completed_state.get("reasoning_details"),
+        "usage": completed_state.get("usage"),
+        "agent": completed_state["selected_agent"],
+        "agent_run_id": run.id,
+    }
+    if completed_state.get("pending_approval_id"):
+        metadata["pending_approval_id"] = completed_state["pending_approval_id"]
+    if assistant_message is None:
+        assistant_message = Message(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            role="assistant",
+            content=completed_state["answer"],
+            metadata_json=metadata,
+            created_at=now,
         )
+        session.add(assistant_message)
+    else:
+        assistant_message.content = completed_state["answer"]
+        assistant_message.metadata_json = metadata
     conversation.updated_at = now
-    run.status = "completed"
-    await session.commit()
-    await emit_event(
-        session,
-        run_id=run.id,
-        agent_name="aether_core",
-        event_type="workflow.completed",
-        payload={
-            "status": "completed",
-            "model": completed_state["model_id"],
-            "selected_agent": completed_state["selected_agent"],
-            "resumed": True,
-        },
+    is_waiting_approval = completed_state.get("pending_approval_id") is not None
+    is_cancelled = bool(completed_state.get("cancelled"))
+    is_limited = bool(completed_state.get("limit_reached"))
+    run.status = (
+        "waiting_approval" if is_waiting_approval else
+        "cancelled" if is_cancelled else
+        "limit_reached" if is_limited else
+        "completed"
     )
+    await session.commit()
+    if not is_waiting_approval and not is_cancelled and not is_limited:
+        await emit_event(
+            session,
+            run_id=run.id,
+            agent_name="aether_core",
+            event_type="workflow.completed",
+            payload={
+                "status": "completed",
+                "model": completed_state["model_id"],
+                "selected_agent": completed_state["selected_agent"],
+                "resumed": True,
+            },
+        )
     return ChatResponse(
         conversation_id=conversation.id,
         reply=completed_state["answer"],
@@ -469,4 +572,5 @@ async def resume_agent_run(
         created_at=now,
         run_id=run.id,
         selected_agent=completed_state["selected_agent"],
+        pending_approval_id=completed_state.get("pending_approval_id"),
     )

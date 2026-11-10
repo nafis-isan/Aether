@@ -1,7 +1,7 @@
 import re
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,6 +45,13 @@ class Settings(BaseSettings):
         default=12000,
         validation_alias=AliasChoices("AETHER_BROWSER_MAX_PAGE_CHARS", "BROWSER_MAX_PAGE_CHARS"),
     )
+    agent_max_plan_steps: int = 5
+    agent_max_tool_calls: int = 5
+    agent_max_model_calls: int = 10
+    agent_max_run_seconds: int = 120
+    agent_max_completion_tokens: int = 1200
+    agent_max_context_chars: int = 40000
+    agent_max_cost_usd: float = 0.25
 
     @field_validator("browser_allowed_hosts")
     @classmethod
@@ -66,6 +73,50 @@ class Settings(BaseSettings):
     def validate_browser_max_page_chars(cls, value: int) -> int:
         if not 1000 <= value <= 30000:
             raise ValueError("BROWSER_MAX_PAGE_CHARS must be between 1000 and 30000")
+        return value
+
+    @field_validator(
+        "agent_max_plan_steps",
+        "agent_max_tool_calls",
+        "agent_max_model_calls",
+        "agent_max_run_seconds",
+        "agent_max_completion_tokens",
+        "agent_max_context_chars",
+    )
+    @classmethod
+    def validate_agent_limits(cls, value: int, info: ValidationInfo) -> int:
+        maximums = {
+            "agent_max_plan_steps": 8,
+            "agent_max_tool_calls": 20,
+            "agent_max_model_calls": 30,
+            "agent_max_run_seconds": 600,
+            "agent_max_completion_tokens": 4000,
+            "agent_max_context_chars": 200000,
+        }
+        minimum = 5000 if info.field_name == "agent_max_context_chars" else 1
+        if not minimum <= value <= maximums[info.field_name]:
+            raise ValueError(f"{info.field_name} is outside supported bounds")
+        return value
+
+    @field_validator("agent_max_cost_usd")
+    @classmethod
+    def validate_agent_max_cost(cls, value: float) -> float:
+        if not 0.01 <= value <= 10:
+            raise ValueError("AGENT_MAX_COST_USD must be between 0.01 and 10")
+        return value
+
+    @field_validator("openrouter_max_retries")
+    @classmethod
+    def validate_openrouter_retries(cls, value: int) -> int:
+        if not 0 <= value <= 5:
+            raise ValueError("OPENROUTER_MAX_RETRIES must be between 0 and 5")
+        return value
+
+    @field_validator("openrouter_timeout_seconds")
+    @classmethod
+    def validate_openrouter_timeout(cls, value: float) -> float:
+        if not 1 <= value <= 120:
+            raise ValueError("OPENROUTER_TIMEOUT_SECONDS must be between 1 and 120")
         return value
 
     @field_validator("jwt_secret")

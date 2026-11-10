@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.orchestrator import WorkflowState, run_workflow
 from app.ai.openrouter import OpenRouterClient, OpenRouterError
 from app.api.routes.chat import provider_http_status
 from app.core.security import get_current_user
@@ -176,12 +177,16 @@ async def decide_approval(
     )
 
     continuation_messages = pending_state.get("continuation_messages")
-    tool_call = pending_state.get("pending_tool_call")
-    if not isinstance(continuation_messages, list) or not isinstance(tool_call, dict):
+    if not isinstance(continuation_messages, list):
         run.status = "failed"
         await session.commit()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approval continuation is unavailable")
-    continuation_messages = [
+    tool_call = pending_state.get("pending_tool_call")
+    if not isinstance(tool_call, dict):
+        run.status = "failed"
+        await session.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approved tool call is unavailable")
+    resume_messages = [
         *continuation_messages,
         {
             "role": "tool",
@@ -189,35 +194,23 @@ async def decide_approval(
             "content": json.dumps(output, ensure_ascii=True),
         },
     ]
+    resume_state: WorkflowState = {
+        **pending_state,
+        "resume_messages": resume_messages,
+        "tool_calls": pending_state.get("tool_calls", 0),
+    }
+    resume_state.pop("pending_approval_id", None)
+    resume_state.pop("pending_tool_call", None)
+    resume_state.pop("continuation_messages", None)
     try:
-        completion = await openrouter.complete(
-            model=run.model_id,
-            messages=continuation_messages,
-        )
+        completion = await run_workflow(session=session, client=openrouter, run=run, state=resume_state)
     except OpenRouterError as exc:
-        run.status = "failed"
-        await session.commit()
-        await emit_event(
-            session,
-            run_id=run.id,
-            agent_name=run.selected_agent,
-            event_type="workflow.failed",
-            payload={"status": "failed", "error": "The AI provider could not complete this workflow."},
-        )
         raise HTTPException(
             status_code=provider_http_status(exc),
             detail=exc.user_message,
         ) from None
 
-    answer = completion["content"]
-    result_state = {
-        **pending_state,
-        "answer": answer,
-        "reasoning_details": completion.get("reasoning_details"),
-        "usage": completion.get("usage"),
-        "approval_status": "approved",
-    }
-    await persist_checkpoint(session, run_id=run.id, key="worker-completed", state=result_state)
+    answer = completion["answer"]
     await _save_assistant_reply(
         session,
         conversation_id=conversation.id,
@@ -226,22 +219,22 @@ async def decide_approval(
         approval_status="approved",
     )
     conversation.updated_at = datetime.now(timezone.utc)
-    run.status = "completed"
+    is_waiting_approval = completion.get("pending_approval_id") is not None
+    run.status = (
+        "waiting_approval" if is_waiting_approval else
+        "cancelled" if completion.get("cancelled") else
+        "limit_reached" if completion.get("limit_reached") else
+        "completed"
+    )
     await session.commit()
-    await emit_event(
-        session,
-        run_id=run.id,
-        agent_name=run.selected_agent,
-        event_type="agent.completed",
-        payload={"agent": run.selected_agent, "status": "completed"},
-    )
-    await emit_event(
-        session,
-        run_id=run.id,
-        agent_name="aether_core",
-        event_type="workflow.completed",
-        payload={"status": "completed", "model": run.model_id, "selected_agent": run.selected_agent},
-    )
+    if not is_waiting_approval and not completion.get("cancelled") and not completion.get("limit_reached"):
+        await emit_event(
+            session,
+            run_id=run.id,
+            agent_name="aether_core",
+            event_type="workflow.completed",
+            payload={"status": "completed", "model": run.model_id, "selected_agent": run.selected_agent},
+        )
     return ChatResponse(
         conversation_id=conversation.id,
         reply=answer,
@@ -249,6 +242,7 @@ async def decide_approval(
         created_at=datetime.now(timezone.utc),
         run_id=run.id,
         selected_agent=run.selected_agent,
+        pending_approval_id=completion.get("pending_approval_id"),
     )
 
 

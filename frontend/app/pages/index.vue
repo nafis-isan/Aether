@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import MarkdownIt from 'markdown-it';
+import taskLists from 'markdown-it-task-lists';
+
 type User = {
   id: string;
   email: string;
@@ -38,6 +41,12 @@ type ActivityEvent = {
   run_id: string;
   created_at: string;
   data: Record<string, unknown>;
+};
+
+type PlanProgress = {
+  index: number;
+  description: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'stopped';
 };
 
 type AgentDefinition = {
@@ -96,6 +105,8 @@ type SpeechRecognitionLike = {
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
 const runtimeConfig = useRuntimeConfig();
+const markdown = new MarkdownIt({ html: false, breaks: true, linkify: false })
+  .use(taskLists, { label: true });
 const apiBase = runtimeConfig.public.apiBase;
 const wsBase = runtimeConfig.public.wsBase;
 const token = useState<string | null>('aether-access-token', () => null);
@@ -114,6 +125,7 @@ const activeConversationId = ref<string | null>(null);
 const draft = ref('');
 const modelRole = ref<'general' | 'coding'>('general');
 const busy = ref(false);
+const isStoppingRun = ref(false);
 const errorMessage = ref('');
 const backendStatus = ref<'checking' | 'connected' | 'unavailable'>('checking');
 const backendHealthError = ref('');
@@ -196,12 +208,58 @@ const displayMessages = computed<ChatMessage[]>(() => {
   ];
 });
 
+function renderMessageMarkdown(content: string): string {
+  return markdown.render(content);
+}
+
 const currentRunEvents = computed(() => {
   const latestEvent = activityEvents.value.at(-1);
   if (!latestEvent) return [];
   return activityEvents.value
     .filter((event) => event.run_id === latestEvent.run_id)
     .sort((left, right) => left.sequence - right.sequence);
+});
+
+const currentPlanProgress = computed<PlanProgress[]>(() => {
+  const planEvent = currentRunEvents.value.find((event) => event.type === 'plan.created');
+  const rawSteps = planEvent?.data.steps;
+  if (!Array.isArray(rawSteps)) return [];
+  return rawSteps.flatMap((rawStep): PlanProgress[] => {
+    if (typeof rawStep !== 'object' || rawStep === null || !('index' in rawStep) || !('description' in rawStep)) {
+      return [];
+    }
+    const index = rawStep.index;
+    const description = rawStep.description;
+    if (typeof index !== 'number' || typeof description !== 'string') return [];
+    const stepEvents = currentRunEvents.value.filter(
+      (event) => event.data.index === index
+        && (event.type === 'plan.step.started' || event.type === 'plan.step.completed')
+    );
+    const latestStepEvent = stepEvents.at(-1);
+    const runStopped = ['workflow.failed', 'workflow.cancelled', 'workflow.limited']
+      .includes(currentRunEvents.value.at(-1)?.type || '');
+    return [{
+      index,
+      description,
+      status: latestStepEvent?.type === 'plan.step.completed'
+        ? 'completed'
+        : latestStepEvent?.type === 'plan.step.started'
+          ? runStopped ? 'stopped' : 'in_progress'
+          : 'pending'
+    }];
+  });
+});
+
+const isWorkflowActive = computed(() => {
+  const latestEvent = currentRunEvents.value.at(-1);
+  if (!latestEvent) return false;
+  return ![
+    'workflow.completed',
+    'workflow.failed',
+    'workflow.cancelled',
+    'workflow.limited'
+  ].includes(latestEvent.type)
+    && latestEvent.data.status !== 'waiting_approval';
 });
 
 const currentRouteEvent = computed(() => currentRunEvents.value
@@ -217,6 +275,9 @@ const currentRunStatus = computed(() => {
   const latestEvent = currentRunEvents.value.at(-1);
   if (!latestEvent) return 'Belum ada aktivitas';
   if (latestEvent.type === 'workflow.failed' || latestEvent.data.status === 'failed') return 'Gagal';
+  if (latestEvent.type === 'workflow.cancelled') return 'Dihentikan';
+  if (latestEvent.type === 'workflow.limited') return 'Batas eksekusi tercapai';
+  if (latestEvent.type === 'workflow.stop_requested') return 'Menghentikan run…';
   if (latestEvent.data.status === 'waiting_approval') return 'Menunggu persetujuan';
   if (latestEvent.type === 'workflow.completed') return 'Selesai';
   if (latestEvent.type === 'agent.started' && latestEvent.data.agent === 'aether_core') return 'Core memproses';
@@ -289,6 +350,12 @@ function activityActor(event: ActivityEvent): string {
 function activityDescription(event: ActivityEvent): string {
   if (event.type === 'agent.started' && event.data.agent === 'aether_core') return 'Mulai menganalisis permintaan';
   if (event.data.status === 'routed') return `Memilih ${agentDisplayName(event.data.agent)}`;
+  if (event.type === 'plan.created') return 'Membuat rencana langkah';
+  if (event.type === 'plan.step.started') return `Mulai langkah ${String(event.data.index || '')}`;
+  if (event.type === 'plan.step.completed') return `Menyelesaikan langkah ${String(event.data.index || '')}`;
+  if (event.type === 'workflow.stop_requested') return 'Permintaan berhenti diterima';
+  if (event.type === 'workflow.cancelled') return 'Run dihentikan';
+  if (event.type === 'workflow.limited') return 'Run berhenti pada batas eksekusi';
   if (event.type === 'agent.started') return 'Mulai bekerja';
   if (event.type === 'agent.completed') return 'Menyelesaikan tugas';
   if (event.type === 'agent.status' && event.data.status === 'waiting_approval') return 'Menunggu persetujuan';
@@ -460,7 +527,7 @@ function openActivitySocket(generation: number): void {
       activityEvents.value = [...activityEvents.value, event]
         .sort((left, right) => left.created_at.localeCompare(right.created_at)
           || (left.run_id === right.run_id ? left.sequence - right.sequence : 0))
-        .slice(-30);
+        .slice(-200);
       if (event.type === 'approval.required') {
         void loadApprovals().catch((error: unknown) => {
           errorMessage.value = getErrorMessage(error);
@@ -638,6 +705,23 @@ async function sendMessage(): Promise<void> {
     if (!isListening.value && !window.speechSynthesis?.speaking) {
       voiceStatus.value = '';
     }
+  }
+}
+
+async function stopCurrentRun(): Promise<void> {
+  const runId = currentRunEvents.value[0]?.run_id;
+  if (!runId || isStoppingRun.value) return;
+  errorMessage.value = '';
+  isStoppingRun.value = true;
+  try {
+    await $fetch(`${apiBase}/agents/runs/${runId}/stop`, {
+      method: 'POST',
+      headers: authHeaders()
+    });
+  } catch (error) {
+    errorMessage.value = getErrorMessage(error);
+  } finally {
+    isStoppingRun.value = false;
   }
 }
 
@@ -946,7 +1030,7 @@ onBeforeUnmount(() => {
                 <div class="message-avatar">{{ message.role === 'assistant' ? 'A' : 'K' }}</div>
                 <div class="message-content">
                   <p class="message-author">{{ message.role === 'assistant' ? 'Aether' : 'Kamu' }}<span v-if="message.pending && message.role === 'assistant'" class="thinking-label">Sedang berpikir</span></p>
-                  <p v-if="message.content" class="message-text">{{ message.content }}</p>
+                  <div v-if="message.content" class="message-markdown" v-html="renderMessageMarkdown(message.content)" />
                   <p v-else-if="message.pending" class="thinking-placeholder"><span />Agent sedang menyiapkan respons…</p>
                 </div>
               </article>
@@ -986,6 +1070,15 @@ onBeforeUnmount(() => {
                       @click="startVoiceInput"
                     >
                       {{ isListening ? 'Selesai ■' : 'Mikrofon' }}
+                    </button>
+                    <button
+                      v-if="busy && isWorkflowActive"
+                      class="stop-button"
+                      type="button"
+                      :disabled="isStoppingRun"
+                      @click="stopCurrentRun"
+                    >
+                      {{ isStoppingRun ? 'Menghentikan…' : 'Hentikan' }}
                     </button>
                     <button class="send-button" type="submit" :disabled="busy || !draft.trim()">
                       {{ busy ? 'Memproses…' : 'Kirim ↑' }}
@@ -1039,6 +1132,19 @@ onBeforeUnmount(() => {
                 </div>
                 <span class="orchestration-state">{{ routedAgentId ? 'Dipilih oleh Aether Core' : 'Menunggu event routing' }}</span>
               </div>
+            </div>
+
+            <div v-if="currentPlanProgress.length" class="plan-progress" aria-label="Rencana eksekusi">
+              <p class="agent-list-label">EXECUTION PLAN</p>
+              <ol>
+                <li v-for="step in currentPlanProgress" :key="step.index" :class="step.status">
+                  <span class="plan-step-index">{{ String(step.index).padStart(2, '0') }}</span>
+                  <span class="plan-step-description">{{ step.description }}</span>
+                  <span class="plan-step-status">
+                    {{ step.status === 'completed' ? 'Selesai' : step.status === 'in_progress' ? 'Berjalan' : step.status === 'stopped' ? 'Terhenti' : 'Menunggu' }}
+                  </span>
+                </li>
+              </ol>
             </div>
 
             <div class="agent-directory">
@@ -1330,8 +1436,29 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .message.assistant .message-avatar { border-color: #4cd7ae55; background: #10251f; color: #72dfbf; }
 .message-content { min-width: 0; }
 .message-author { display: flex; align-items: center; gap: 9px; margin: 0 0 7px; color: #9aa6b5; font-size: 10px; }
-.message-text { margin: 0; color: #e2e8ef; font-size: 13px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
-.message.pending .message-text { color: #cbd4dd; }
+.message-markdown { min-width: 0; color: #e2e8ef; font-size: 13px; line-height: 1.75; overflow-wrap: anywhere; }
+.message.pending .message-markdown { color: #cbd4dd; }
+.message-markdown > :first-child { margin-top: 0; }
+.message-markdown > :last-child { margin-bottom: 0; }
+.message-markdown p { margin: 0 0 0.8em; }
+.message-markdown h1, .message-markdown h2, .message-markdown h3, .message-markdown h4 { margin: 1.15em 0 0.55em; color: #edf2f6; font-weight: 580; line-height: 1.35; letter-spacing: -0.02em; }
+.message-markdown h1 { font-size: 1.35em; }
+.message-markdown h2 { font-size: 1.2em; }
+.message-markdown h3, .message-markdown h4 { font-size: 1.05em; }
+.message-markdown ul, .message-markdown ol { display: grid; gap: 0.38em; margin: 0.55em 0 0.9em; padding-left: 1.5em; }
+.message-markdown li { padding-left: 0.15em; }
+.message-markdown li::marker { color: #72dfbf; }
+.message-markdown .task-list-item { list-style: none; margin-left: -1.5em; }
+.message-markdown .task-list-item-checkbox { width: 0.95em; height: 0.95em; margin: 0 0.55em 0 0; accent-color: #72dfbf; vertical-align: -0.08em; }
+.message-markdown blockquote { margin: 0.9em 0; padding: 0.15em 0 0.15em 1em; border-left: 2px solid #72dfbf66; color: #aab6c2; }
+.message-markdown pre { max-width: 100%; overflow-x: auto; margin: 0.8em 0; padding: 12px 14px; border: 1px solid #ffffff12; border-radius: 4px; background: #090d12; color: #d7e3e1; line-height: 1.6; }
+.message-markdown pre code { padding: 0; border: 0; background: transparent; color: inherit; }
+.message-markdown code { padding: 0.12em 0.38em; border: 1px solid #ffffff12; border-radius: 3px; background: #111820; color: #b7e9d8; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+.message-markdown a { color: #83d9bf; text-decoration: underline; text-decoration-color: #83d9bf66; text-underline-offset: 3px; }
+.message-markdown hr { margin: 1.1em 0; border: 0; border-top: 1px solid #ffffff18; }
+.message-markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.message-markdown th, .message-markdown td { padding: 7px 10px; border: 1px solid #ffffff18; text-align: left; }
+.message-markdown th { color: #edf2f6; background: #111820; }
 .thinking-label { color: #7f8e9b; font-size: 9px; }
 .thinking-placeholder { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: #9ca9b5; font-size: 11px; }
 .thinking-placeholder span { width: 7px; height: 7px; border: 1px solid #72dfbf; border-radius: 50%; background: #72dfbf55; }
@@ -1529,7 +1656,6 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .message-avatar { flex-basis: 24px; height: 24px; border-radius: 4px; background: #10141b; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .message.assistant .message-avatar { border-color: #ffffff1b; background: #101714; }
 .message-author { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
-.message-text { font-size: 13px; line-height: 1.8; }
 .composer-wrap { width: 100%; max-width: 780px; padding: 12px 0 0; }
 .composer { padding: 11px 12px 9px; border-radius: 5px; background: #0d1117; }
 .composer textarea { font-size: 12px; }
@@ -1643,9 +1769,20 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .voice-toggle, .voice-button { border-color: transparent; background: #3b3b3b; color: #d3d3d3; }
 .voice-toggle[aria-pressed="true"] { border-color: transparent; color: #9ce5cd; }
 .voice-button.listening { background: #183229; }
+.stop-button { padding: 8px 10px; border: 1px solid #ec6c7266; border-radius: 6px; background: #3b2426; color: #ffb6ba; font-size: 9px; }
+.stop-button:hover:not(:disabled) { background: #512d30; }
 .send-button { padding: 8px 11px; }
 .voice-privacy { margin-top: 6px; color: #747474; text-align: center; }
 .voice-status { text-align: center; }
+.plan-progress { margin-top: 15px; padding-top: 2px; border-top: 1px solid #ffffff0d; }
+.plan-progress ol { display: grid; gap: 6px; margin: 8px 0 0; padding: 0; list-style: none; }
+.plan-progress li { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: start; gap: 8px; color: #929eaa; font-size: 10px; line-height: 1.5; }
+.plan-step-index { color: #6f7b88; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.plan-step-description { overflow-wrap: anywhere; }
+.plan-step-status { color: #687586; font-size: 8px; white-space: nowrap; }
+.plan-progress li.in_progress .plan-step-status { color: #d3a64e; }
+.plan-progress li.completed .plan-step-status { color: #72dfbf; }
+.plan-progress li.stopped .plan-step-status { color: #ec9a82; }
 
 @media (max-width: 760px) {
   .topbar { height: 56px; padding: 0 16px; }
@@ -1662,6 +1799,7 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
   .chat-body.welcome-chat .inline-model-select select { max-width: 120px; padding: 7px 5px; font-size: 8px; }
   .chat-body.welcome-chat .voice-toggle,
   .chat-body.welcome-chat .voice-button,
+  .chat-body.welcome-chat .stop-button,
   .chat-body.welcome-chat .send-button { padding: 7px 6px; font-size: 8px; }
 }
 

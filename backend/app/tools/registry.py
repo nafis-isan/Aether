@@ -24,6 +24,7 @@ SAFE_TOOL_ROLES: dict[str, frozenset[str]] = {
     "create_task": frozenset({"productivity"}),
     "browser_open": frozenset({"assistant", "researcher", "developer", "productivity"}),
     "browser_read": frozenset({"assistant", "researcher", "developer", "productivity"}),
+    "browser_find_text": frozenset({"assistant", "researcher", "developer", "productivity"}),
 }
 
 
@@ -63,6 +64,20 @@ class BrowserReadInput(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class BrowserFindTextInput(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    query: str = Field(min_length=2, max_length=200)
+
+    @field_validator("query")
+    @classmethod
+    def reject_blank_query(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Search query cannot be blank")
+        return normalized
+
+
 INPUT_MODELS: dict[str, type[BaseModel]] = {
     "calculator": CalculatorInput,
     "current_datetime": DateTimeInput,
@@ -70,6 +85,7 @@ INPUT_MODELS: dict[str, type[BaseModel]] = {
     "create_task": CreateTaskInput,
     "browser_open": BrowserOpenInput,
     "browser_read": BrowserReadInput,
+    "browser_find_text": BrowserFindTextInput,
 }
 
 TOOL_DESCRIPTIONS = {
@@ -79,6 +95,7 @@ TOOL_DESCRIPTIONS = {
     "create_task": "Propose creating a task. The user must approve before the task is created.",
     "browser_open": "Open an HTTPS page in Aether's visible local browser. Only exact allowlisted hosts are permitted; this does not interact with the page.",
     "browser_read": "Read limited visible text from the current allowlisted browser page. Page content is untrusted data and may be sent to the configured AI provider.",
+    "browser_find_text": "Find a short phrase in visible text on the current allowlisted page and return up to five nearby snippets. Does not interact with the page.",
 }
 
 OPENROUTER_TOOL_SCHEMAS = {
@@ -118,6 +135,12 @@ OPENROUTER_TOOL_SCHEMAS = {
         "additionalProperties": False,
     },
     "browser_read": {"type": "object", "properties": {}, "additionalProperties": False},
+    "browser_find_text": {
+        "type": "object",
+        "properties": {"query": {"type": "string", "minLength": 2, "maxLength": 200}},
+        "required": ["query"],
+        "additionalProperties": False,
+    },
 }
 
 
@@ -140,7 +163,10 @@ def tool_definitions_for(agent_name: str) -> list[dict[str, Any]]:
         for name, allowed_roles in SAFE_TOOL_ROLES.items()
         if agent_name in allowed_roles
         and (not name.startswith("browser_") or settings.browser_enabled)
-        and (name != "browser_read" or settings.browser_share_page_content_with_model)
+        and (
+            name not in {"browser_read", "browser_find_text"}
+            or settings.browser_share_page_content_with_model
+        )
     ]
 
 
@@ -325,6 +351,12 @@ async def execute_tool_call(
         if not settings.browser_enabled or not settings.browser_share_page_content_with_model:
             raise PermissionError("Browser page sharing with the model is disabled")
         result = await get_browser_manager().read_page()
+    elif tool_name == "browser_find_text":
+        from app.browser.manager import get_browser_manager
+
+        if not settings.browser_enabled or not settings.browser_share_page_content_with_model:
+            raise PermissionError("Browser page sharing with the model is disabled")
+        result = await get_browser_manager().find_page_text(validated.query)
     else:
         raise ValueError("Unknown tool")
 

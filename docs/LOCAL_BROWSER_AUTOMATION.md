@@ -48,6 +48,8 @@ Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/browser/read
 
 ## Agent access and privacy
 
-When enabled, the assistant can use the restricted `browser_open` tool. The `browser_read` tool is withheld unless both browser automation and `AETHER_BROWSER_SHARE_PAGE_CONTENT_WITH_MODEL=true` are enabled. Page content may contain prompt injection and personal data; when read through the agent tool, it is sent to the configured model provider (currently OpenRouter) and retained with the tool execution/checkpoint data in Aether's database. Keep model sharing disabled unless you explicitly accept both data flows. Page text is truncated to the configured limit and treated as untrusted data.
+When enabled, the assistant can use the restricted `browser_open` tool. The `browser_read` and `browser_find_text` tools are withheld unless both browser automation and `AETHER_BROWSER_SHARE_PAGE_CONTENT_WITH_MODEL=true` are enabled. `browser_find_text` searches only visible text from the current page and returns up to five short snippets; it does not use a search engine or interact with page controls. Page content may contain prompt injection and personal data; when read through the agent tool, it is sent to the configured model provider (currently OpenRouter) and retained with the tool execution/checkpoint data in Aether's database. Keep model sharing disabled unless you explicitly accept both data flows. Page text is truncated to the configured limit and treated as untrusted data.
+
+For goal plans, execution limits, cancellation, and checkpoints, see [Agent execution](./AGENT_EXECUTION.md).
 
 The browser profile contains login state and cookies. Protect the Windows account and profile directory, and do not copy this profile or reuse it as your normal browser profile. Browser automation can also be restricted by websites; use official APIs for business-critical workflows.

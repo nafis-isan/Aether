@@ -60,7 +60,7 @@ async def test_task_creation_tool_waits_for_approval_and_resumes(client, monkeyp
                 },
             )
         assert body["messages"][-1]["role"] == "tool"
-        assert not body.get("tools")
+        assert body.get("tools")
         return httpx.Response(
             200,
             json={"choices": [{"message": {"role": "assistant", "content": "Task created."}}]},
@@ -396,9 +396,11 @@ async def test_websocket_authenticates_ownership_and_replays_event_cursors(clien
                 },
             )
             assert next_chat.status_code == 200
+            next_run_id = next_chat.json()["run_id"]
             live_event = socket.receive_json()
+            while live_event["run_id"] != next_run_id:
+                live_event = socket.receive_json()
             assert live_event["type"] == "agent.started"
-            assert live_event["run_id"] == next_chat.json()["run_id"]
 
 
 def test_calculator_rejects_unsafe_and_invalid_arithmetic():

@@ -97,7 +97,10 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
         assert event_types == [
             "agent.started",
             "agent.status",
+            "plan.created",
             "agent.started",
+            "plan.step.started",
+            "plan.step.completed",
             "agent.completed",
             "workflow.completed",
         ]
@@ -106,7 +109,10 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
         )
         assert {checkpoint.checkpoint_key for checkpoint in checkpoints.scalars().all()} == {
             "supervisor-routed",
+            "plan-created",
             "worker-start",
+            "workflow-budget",
+            "plan-step-1-completed",
             "worker-completed",
         }
 

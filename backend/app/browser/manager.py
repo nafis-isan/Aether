@@ -158,6 +158,30 @@ class LocalBrowserManager:
             except PlaywrightError as exc:
                 raise BrowserUnavailableError("The browser could not read the current page") from exc
 
+    async def find_page_text(self, query: str) -> dict[str, str | int | list[str]]:
+        page_data = await self.read_page()
+        text = page_data["text"]
+        normalized_text = text.casefold()
+        normalized_query = query.casefold()
+        matches: list[str] = []
+        cursor = 0
+        while len(matches) < 5:
+            position = normalized_text.find(normalized_query, cursor)
+            if position < 0:
+                break
+            start = max(0, position - 100)
+            end = min(len(text), position + len(query) + 100)
+            snippet = " ".join(text[start:end].split())
+            matches.append(snippet)
+            cursor = position + len(normalized_query)
+        return {
+            "url": page_data["url"],
+            "title": page_data["title"],
+            "query": query,
+            "match_count": len(matches),
+            "matches": matches,
+        }
+
     async def status(self) -> dict[str, str | bool | None]:
         if not settings.browser_enabled:
             return {"enabled": False, "open": False, "url": None, "title": None}

@@ -7,7 +7,7 @@ from app.api.routes import browser as browser_route
 from app.browser.manager import BrowserPolicyError, LocalBrowserManager
 from app.config import settings
 from app.main import app
-from app.tools.registry import tool_definitions_for
+from app.tools.registry import BrowserFindTextInput, tool_definitions_for
 
 
 async def _auth_headers(client: AsyncClient, email: str) -> dict[str, str]:
@@ -54,6 +54,32 @@ def test_browser_agent_tools_are_opt_in(monkeypatch):
     monkeypatch.setattr(settings, "browser_share_page_content_with_model", True)
     names = {item["function"]["name"] for item in tool_definitions_for("assistant")}
     assert "browser_read" in names
+    assert "browser_find_text" in names
+
+
+def test_browser_find_text_requires_a_short_nonblank_query():
+    assert BrowserFindTextInput.model_validate({"query": " release "}).query == "release"
+    with pytest.raises(ValueError):
+        BrowserFindTextInput.model_validate({"query": " "})
+    with pytest.raises(ValueError):
+        BrowserFindTextInput.model_validate({"query": "x"})
+
+
+@pytest.mark.asyncio
+async def test_browser_find_text_returns_bounded_snippets(monkeypatch):
+    manager = LocalBrowserManager()
+
+    async def read_page() -> dict[str, str]:
+        return {
+            "url": "https://example.com",
+            "title": "Example",
+            "text": "Release notes: stable. More release details. Final release.",
+        }
+
+    monkeypatch.setattr(manager, "read_page", read_page)
+    found = await manager.find_page_text("release")
+    assert found["match_count"] == 3
+    assert len(found["matches"]) == 3
 
 
 @pytest.mark.asyncio

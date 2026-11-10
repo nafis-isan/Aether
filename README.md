@@ -11,7 +11,8 @@ This repository contains:
 - Local MySQL development using Laragon on `localhost:3306`
 - Account registration/login, owner-scoped conversations, and MySQL migrations
 - OpenRouter chat with general/coding models and server-side tool calls
-- Supervisor/worker agent workflow with MySQL event and recovery checkpoints
+- Goal-oriented supervisor/planner/worker workflow with ordered plans, event progress, and MySQL recovery checkpoints
+- Bounded model/tool execution with provider-reported cost checks and a cooperative run-stop endpoint
 - User-approved task creation, task APIs, and user-controlled memory
 - Authenticated WebSocket activity replay and reconnect
 
@@ -94,6 +95,9 @@ described by the `awwwards-mcp` package documentation. No API key is required.
 - Manage owned tasks at `/api/v1/tasks`. Manage explicit, user-approved memories at `/api/v1/memory`; memories are not captured automatically, and credential-like values are rejected.
 - Connect to `/ws/chat/{conversation_id}` using the `aether` and `aether.bearer.<access_token>` WebSocket subprotocols. The optional `after` query parameter is a JSON object mapping run IDs to their last received sequence, e.g. `{"run-id":12}`. Events are replayed from MySQL and new events are polled from the database, so reconnect does not depend on in-memory server state.
 - Resume failed workflows with `POST /api/v1/agents/runs/{run_id}/resume`; inspect persisted activity at `GET /api/v1/agents/runs/{run_id}/events`.
+- Stop an active run with `POST /api/v1/agents/runs/{run_id}/stop`. Multi-action requests show their plan and step progress in the workspace.
+- Configure plan, model-call, tool-call, context, completion-token, time, and reported-cost limits with the `AGENT_MAX_*` settings in `backend/.env.example`. The cost setting depends on provider usage reporting; hard call/token/time limits also apply.
+- Browser automation remains opt-in. It can open allowlisted pages and, with explicit model-sharing consent, read or search visible page text; it cannot click or submit. See [Agent execution](./docs/AGENT_EXECUTION.md) and [Local browser automation](./docs/LOCAL_BROWSER_AUTOMATION.md).
 - Passwords use Argon2id hashing; chat messages and conversations are scoped to their owner in MySQL.
 - OpenRouter reasoning details are preserved server-side for model continuation and are not included in chat API responses.
 - The Nuxt homepage provides local single-user startup by default, plus account registration/login when local mode is disabled; it also includes conversation history, model selection, live agent activity, approval actions, and memory controls.

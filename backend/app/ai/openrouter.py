@@ -32,6 +32,7 @@ class OpenRouterClient:
         model: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if not settings.openrouter_api_key:
             raise OpenRouterError("configuration_error", "The AI provider is not configured.")
@@ -44,7 +45,10 @@ class OpenRouterClient:
             "model": model,
             "messages": messages,
             "reasoning": {"enabled": True},
+            "max_tokens": settings.agent_max_completion_tokens,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
