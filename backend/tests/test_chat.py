@@ -39,6 +39,7 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
                         }
                     }
                 ],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16, "cost": 0.002},
             },
         )
 
@@ -59,7 +60,17 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
     ).json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    first = await client.post("/api/v1/chat", headers=headers, json={"message": "Hello"})
+    created_conversation = await client.post(
+        "/api/v1/conversations",
+        headers=headers,
+        json={"title": "Hello"},
+    )
+    assert created_conversation.status_code == 201
+    first = await client.post(
+        "/api/v1/chat",
+        headers=headers,
+        json={"message": "Hello", "conversation_id": created_conversation.json()["id"]},
+    )
     assert first.status_code == 200
     first_body = first.json()
     assert first_body["reply"] == "answer-1"
@@ -87,6 +98,16 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
     assert registration.status_code == 201
     run_id = second.json()["run_id"]
     async with app.state.test_session_factory() as session:
+        first_usage = await session.scalar(
+            select(AgentEvent).where(
+                AgentEvent.agent_run_id == first_body["run_id"],
+                AgentEvent.event_type == "usage.updated",
+            )
+        )
+        assert first_usage is not None
+        assert first_usage.payload["model_calls"] == 1
+        assert first_usage.payload["usage"] == {}
+
         run = await session.get(AgentRun, run_id)
         assert run.status == "completed"
         assert run.selected_agent == "assistant"
@@ -94,7 +115,7 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
             select(AgentEvent).where(AgentEvent.agent_run_id == run_id).order_by(AgentEvent.sequence)
         )
         event_types = [event.event_type for event in events.scalars().all()]
-        assert event_types == [
+        assert [event for event in event_types if event not in {"assistant.delta", "usage.updated"}] == [
             "agent.started",
             "agent.status",
             "plan.created",
@@ -104,6 +125,17 @@ async def test_chat_persists_conversation_and_replays_reasoning_details(client, 
             "agent.completed",
             "workflow.completed",
         ]
+        assert "assistant.delta" in event_types
+        assert "usage.updated" in event_types
+        usage_event = await session.scalar(
+            select(AgentEvent).where(
+                AgentEvent.agent_run_id == run_id,
+                AgentEvent.event_type == "usage.updated",
+            ).order_by(AgentEvent.sequence.desc())
+        )
+        assert usage_event is not None
+        assert usage_event.payload["usage"]["total_tokens"] == 16
+        assert usage_event.payload["usage"]["cost"] == 0.002
         checkpoints = await session.execute(
             select(AgentCheckpoint).where(AgentCheckpoint.agent_run_id == run_id)
         )

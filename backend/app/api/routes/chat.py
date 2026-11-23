@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -21,13 +22,37 @@ from app.database.models import (
     ToolExecution,
     User,
 )
-from app.schemas.chat import ChatRequest, ChatResponse, ConversationRead, MessageRead
+from app.schemas.chat import (
+    ChatRequest,
+    ChatResponse,
+    ConversationCreate,
+    ConversationRead,
+    MessageRead,
+    RunRedirectRequest,
+)
 from app.services.memory import retrieve_relevant_memories
-from app.services.workflow import emit_event
+from app.services.workflow import emit_assistant_delta, emit_event
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 openrouter = OpenRouterClient()
 MAX_CONTEXT_MESSAGES = 20
+
+
+@router.post("/conversations", response_model=ConversationRead, status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    payload: ConversationCreate,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Conversation:
+    conversation = Conversation(
+        id=str(uuid4()),
+        user_id=user.id,
+        title=payload.title,
+    )
+    session.add(conversation)
+    await session.commit()
+    await session.refresh(conversation)
+    return conversation
 
 
 def provider_http_status(error: OpenRouterError) -> int:
@@ -157,7 +182,13 @@ async def send_chat_message(
         payload={"agent": "aether_core", "status": "started"},
     )
     try:
-        completion = await run_workflow(session=session, client=openrouter, run=run, state=state)
+        completion = await run_workflow(
+            session=session,
+            client=openrouter,
+            run=run,
+            state=state,
+            on_text_delta=lambda text: emit_assistant_delta(session, run_id=run.id, text=text),
+        )
     except OpenRouterError as exc:
         raise HTTPException(
             status_code=provider_http_status(exc),
@@ -186,12 +217,13 @@ async def send_chat_message(
     is_limited = bool(completion.get("limit_reached"))
     run.status = (
         "waiting_approval" if is_waiting_approval else
+        "paused" if completion.get("paused") else
         "cancelled" if is_cancelled else
         "limit_reached" if is_limited else
         "completed"
     )
     await session.commit()
-    if not is_waiting_approval and not is_cancelled and not is_limited:
+    if not is_waiting_approval and not completion.get("paused") and not is_cancelled and not is_limited:
         await emit_event(
             session,
             run_id=run.id,
@@ -215,6 +247,296 @@ async def send_chat_message(
     )
 
 
+@router.post("/agents/runs/{run_id}/pause", status_code=status.HTTP_202_ACCEPTED)
+async def pause_agent_run(
+    run_id: str,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    result = await session.execute(
+        select(AgentRun)
+        .where(AgentRun.id == run_id, AgentRun.user_id == user.id)
+        .with_for_update()
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
+    if run.status in {"pause_requested", "paused"}:
+        return {"status": run.status}
+    if run.status != "running":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent run is not running")
+    run.status = "pause_requested"
+    await session.commit()
+    await emit_event(
+        session,
+        run_id=run.id,
+        agent_name="aether_core",
+        event_type="workflow.pause_requested",
+        payload={"status": "pause_requested"},
+    )
+    return {"status": "pause_requested"}
+
+
+@router.post("/agents/runs/{run_id}/redirect", response_model=ChatResponse)
+async def redirect_agent_run(
+    run_id: str,
+    payload: RunRedirectRequest,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ChatResponse:
+    run_result = await session.execute(
+        select(AgentRun)
+        .where(AgentRun.id == run_id, AgentRun.user_id == user.id)
+        .with_for_update()
+    )
+    previous_run = run_result.scalar_one_or_none()
+    if previous_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
+    if previous_run.status not in {"running", "pause_requested", "paused", "cancel_requested", "cancelled"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent run cannot be redirected")
+
+    redirected_while_running = previous_run.status != "paused"
+    if previous_run.status in {"running", "pause_requested"}:
+        previous_run.status = "cancel_requested"
+        await session.commit()
+        await emit_event(
+            session,
+            run_id=previous_run.id,
+            agent_name="aether_core",
+            event_type="workflow.stop_requested",
+            payload={"status": "cancel_requested", "reason": "redirect"},
+        )
+        for _ in range(300):
+            await asyncio.sleep(0.1)
+            await session.refresh(previous_run)
+            if previous_run.status != "cancel_requested":
+                break
+        if previous_run.status == "cancel_requested":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The current run is still stopping. Try redirecting again shortly.",
+            )
+        if previous_run.status != "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The current run did not stop cleanly; redirect was not started.",
+            )
+    elif previous_run.status == "cancel_requested":
+        for _ in range(300):
+            await asyncio.sleep(0.1)
+            await session.refresh(previous_run)
+            if previous_run.status != "cancel_requested":
+                break
+        if previous_run.status != "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The current run did not stop cleanly; redirect was not started.",
+            )
+
+    conversation_result = await session.execute(
+        select(Conversation).where(
+            Conversation.id == previous_run.conversation_id,
+            Conversation.user_id == user.id,
+        )
+    )
+    conversation = conversation_result.scalar_one_or_none()
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    if redirected_while_running:
+        assistant_saved = False
+        for _ in range(100):
+            assistant_messages = await session.scalars(
+                select(Message).where(
+                    Message.conversation_id == conversation.id,
+                    Message.role == "assistant",
+                )
+            )
+            assistant_saved = any(
+                message.metadata_json
+                and message.metadata_json.get("agent_run_id") == previous_run.id
+                for message in assistant_messages.all()
+            )
+            if assistant_saved:
+                break
+            await asyncio.sleep(0.05)
+        if not assistant_saved:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The previous run stopped, but its final message is not yet available.",
+            )
+
+    checkpoint_result = await session.execute(
+        select(AgentCheckpoint).where(
+            AgentCheckpoint.agent_run_id == previous_run.id,
+            AgentCheckpoint.checkpoint_key.in_(("worker-completed", "paused")),
+        )
+    )
+    previous_states = [checkpoint.state_data for checkpoint in checkpoint_result.scalars().all()]
+    previous_state = max(previous_states, key=lambda item: item.get("step_index", 0), default=previous_run.state_snapshot)
+    completed_steps = previous_state.get("step_results", [])
+
+    history_result = await session.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(MAX_CONTEXT_MESSAGES)
+    )
+    history = list(reversed(history_result.scalars().all()))
+    model_messages = [
+        {"role": message.role, "content": message.content}
+        for message in history
+        if not (
+            message.role == "assistant"
+            and message.metadata_json
+            and message.metadata_json.get("agent_run_id") == previous_run.id
+        )
+    ]
+    if completed_steps:
+        completed_context = "\n".join(
+            f"- {item['description']}: {item['result'][:1200]}"
+            for item in completed_steps
+            if isinstance(item, dict)
+            and isinstance(item.get("description"), str)
+            and isinstance(item.get("result"), str)
+        )
+        model_messages.append(
+            {
+                "role": "assistant",
+                "content": f"Completed work from the redirected run, provided as context:\n{completed_context}",
+            }
+        )
+
+    now = datetime.now(timezone.utc)
+    redirect_message = payload.message.strip()
+    model_messages.append({"role": "user", "content": redirect_message})
+    session.add(
+        Message(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            role="user",
+            content=redirect_message,
+            created_at=now,
+        )
+    )
+    memories = await retrieve_relevant_memories(session, user_id=user.id, query=redirect_message)
+    saved_model_role = previous_run.state_snapshot.get("model_role")
+    model_role = (
+        saved_model_role
+        if saved_model_role in {"general", "coding"}
+        else "coding" if previous_run.model_id == resolve_model("coding") else "general"
+    )
+    redirected_run = AgentRun(
+        id=str(uuid4()),
+        conversation_id=conversation.id,
+        user_id=user.id,
+        status="running",
+        selected_agent="aether_core",
+        model_id=resolve_model(model_role),
+        state_snapshot={},
+    )
+    state: WorkflowState = {
+        "run_id": redirected_run.id,
+        "conversation_id": conversation.id,
+        "user_id": user.id,
+        "request": redirect_message,
+        "model_role": model_role,
+        "messages": model_messages,
+        "memories": [memory.content for memory in memories],
+        "step_count": 0,
+        "model_calls": 0,
+        "tool_calls": 0,
+        "reported_cost_usd": 0.0,
+        "redirected_from": previous_run.id,
+    }
+    redirected_run.state_snapshot = state
+    session.add(redirected_run)
+    conversation.updated_at = now
+    await session.commit()
+    await emit_event(
+        session,
+        run_id=redirected_run.id,
+        agent_name="aether_core",
+        event_type="workflow.redirected",
+        payload={"status": "started", "previous_run_id": previous_run.id},
+    )
+    await emit_event(
+        session,
+        run_id=redirected_run.id,
+        agent_name="aether_core",
+        event_type="agent.started",
+        payload={"agent": "aether_core", "status": "started"},
+    )
+    try:
+        completion = await run_workflow(
+            session=session,
+            client=openrouter,
+            run=redirected_run,
+            state=state,
+            on_text_delta=lambda text: emit_assistant_delta(
+                session,
+                run_id=redirected_run.id,
+                text=text,
+            ),
+        )
+    except OpenRouterError as exc:
+        raise HTTPException(
+            status_code=provider_http_status(exc),
+            detail=exc.user_message,
+        ) from None
+
+    assistant_message = Message(
+        id=str(uuid4()),
+        conversation_id=conversation.id,
+        role="assistant",
+        content=completion["answer"],
+        metadata_json={
+            "model": completion["model_id"],
+            "reasoning_details": completion.get("reasoning_details"),
+            "usage": completion.get("usage"),
+            "agent": completion["selected_agent"],
+            "agent_run_id": redirected_run.id,
+            "redirected_from": previous_run.id,
+        },
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(assistant_message)
+    conversation.updated_at = datetime.now(timezone.utc)
+    is_waiting_approval = completion.get("pending_approval_id") is not None
+    is_paused = bool(completion.get("paused"))
+    is_cancelled = bool(completion.get("cancelled"))
+    is_limited = bool(completion.get("limit_reached"))
+    redirected_run.status = (
+        "waiting_approval" if is_waiting_approval else
+        "paused" if is_paused else
+        "cancelled" if is_cancelled else
+        "limit_reached" if is_limited else
+        "completed"
+    )
+    await session.commit()
+    if not is_waiting_approval and not is_paused and not is_cancelled and not is_limited:
+        await emit_event(
+            session,
+            run_id=redirected_run.id,
+            agent_name="aether_core",
+            event_type="workflow.completed",
+            payload={
+                "status": "completed",
+                "model": completion["model_id"],
+                "selected_agent": completion["selected_agent"],
+            },
+        )
+    return ChatResponse(
+        conversation_id=conversation.id,
+        reply=assistant_message.content,
+        model=completion["model_id"],
+        created_at=assistant_message.created_at,
+        run_id=redirected_run.id,
+        selected_agent=completion["selected_agent"],
+        pending_approval_id=completion.get("pending_approval_id"),
+    )
+
+
 @router.post("/agents/runs/{run_id}/stop", status_code=status.HTTP_202_ACCEPTED)
 async def stop_agent_run(
     run_id: str,
@@ -231,7 +553,7 @@ async def stop_agent_run(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
     if run.status == "cancel_requested":
         return {"status": "cancel_requested"}
-    if run.status != "running":
+    if run.status not in {"running", "pause_requested"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent run is not running")
     run.status = "cancel_requested"
     await session.commit()
@@ -332,7 +654,7 @@ async def resume_agent_run(
     run = result.scalar_one_or_none()
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
-    if run.status not in {"running", "failed"}:
+    if run.status not in {"running", "failed", "paused"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent run is not resumable")
 
     conversation_result = await session.execute(
@@ -354,6 +676,14 @@ async def resume_agent_run(
     completed_checkpoint = checkpoint_result.scalar_one_or_none()
     completed_state = completed_checkpoint.state_data if completed_checkpoint is not None else None
     if completed_state is None:
+        paused_checkpoint_result = await session.execute(
+            select(AgentCheckpoint).where(
+                AgentCheckpoint.agent_run_id == run.id,
+                AgentCheckpoint.checkpoint_key == "paused",
+            )
+        )
+        paused_checkpoint = paused_checkpoint_result.scalar_one_or_none()
+        paused_state = paused_checkpoint.state_data if paused_checkpoint is not None else None
         pending_checkpoint_result = await session.execute(
             select(AgentCheckpoint).where(
                 AgentCheckpoint.agent_run_id == run.id,
@@ -363,7 +693,7 @@ async def resume_agent_run(
         pending_checkpoint = pending_checkpoint_result.scalar_one_or_none()
         pending_state = pending_checkpoint.state_data if pending_checkpoint is not None else None
         approved_state: WorkflowState | None = None
-        if pending_state:
+        if pending_state and paused_state is None:
             approval_result = await session.execute(
                 select(Approval).where(
                     Approval.id == pending_state.get("pending_approval_id"),
@@ -414,7 +744,9 @@ async def resume_agent_run(
                 approved_state.pop("pending_tool_call", None)
                 approved_state.pop("continuation_messages", None)
 
-        if approved_state is not None:
+        if paused_state is not None:
+            state = {key: value for key, value in paused_state.items() if key != "paused"}
+        elif approved_state is not None:
             state = approved_state
         else:
             worker_checkpoint_result = await session.execute(
@@ -497,7 +829,13 @@ async def resume_agent_run(
     )
     if completed_state is None:
         try:
-            completed_state = await run_workflow(session=session, client=openrouter, run=run, state=state)
+            completed_state = await run_workflow(
+                session=session,
+                client=openrouter,
+                run=run,
+                state=state,
+                on_text_delta=lambda text: emit_assistant_delta(session, run_id=run.id, text=text),
+            )
         except OpenRouterError as exc:
             raise HTTPException(
                 status_code=provider_http_status(exc),
@@ -543,16 +881,18 @@ async def resume_agent_run(
         assistant_message.metadata_json = metadata
     conversation.updated_at = now
     is_waiting_approval = completed_state.get("pending_approval_id") is not None
+    is_paused = bool(completed_state.get("paused"))
     is_cancelled = bool(completed_state.get("cancelled"))
     is_limited = bool(completed_state.get("limit_reached"))
     run.status = (
         "waiting_approval" if is_waiting_approval else
+        "paused" if is_paused else
         "cancelled" if is_cancelled else
         "limit_reached" if is_limited else
         "completed"
     )
     await session.commit()
-    if not is_waiting_approval and not is_cancelled and not is_limited:
+    if not is_waiting_approval and not is_paused and not is_cancelled and not is_limited:
         await emit_event(
             session,
             run_id=run.id,

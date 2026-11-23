@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import AgentCheckpoint, AgentEvent, AgentRun
@@ -48,13 +48,21 @@ async def emit_event(
     event_type: str,
     payload: dict[str, Any],
 ) -> AgentEvent:
-    run = await session.get(AgentRun, run_id, with_for_update=True)
-    if run is None:
+    updated = await session.execute(
+        update(AgentRun)
+        .where(AgentRun.id == run_id)
+        .values(last_sequence=AgentRun.last_sequence + 1)
+    )
+    if updated.rowcount != 1:
         raise LookupError("Agent run not found while emitting event")
-    run.last_sequence += 1
+    sequence = await session.scalar(
+        select(AgentRun.last_sequence).where(AgentRun.id == run_id)
+    )
+    if sequence is None:
+        raise LookupError("Agent run not found while emitting event")
     event = AgentEvent(
         agent_run_id=run_id,
-        sequence=run.last_sequence,
+        sequence=sequence,
         agent_name=agent_name,
         event_type=event_type,
         payload=payload,
@@ -63,3 +71,18 @@ async def emit_event(
     session.add(event)
     await session.commit()
     return event
+
+
+async def emit_assistant_delta(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    text: str,
+) -> None:
+    await emit_event(
+        session,
+        run_id=run_id,
+        agent_name="aether_core",
+        event_type="assistant.delta",
+        payload={"text": text},
+    )

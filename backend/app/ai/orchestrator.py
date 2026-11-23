@@ -2,12 +2,13 @@ import asyncio
 import json
 import math
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.agents.supervisor import AGENT_DESCRIPTIONS, AgentName, select_agent
+from app.ai.agents.supervisor import AGENT_DESCRIPTIONS, AgentName, route_basis, select_agent
 from app.ai.agents.workers import WORKER_SYSTEM_PROMPTS
 from app.ai.model_router import ModelRole, resolve_model
 from app.ai.openrouter import OpenRouterClient, OpenRouterError
@@ -55,6 +56,11 @@ class WorkflowCancelled(Exception):
         self.state = state
 
 
+class WorkflowPaused(Exception):
+    def __init__(self, state: WorkflowState):
+        self.state = state
+
+
 class WorkflowLimitReached(Exception):
     def __init__(self, state: WorkflowState, reason: str):
         self.state = state
@@ -78,10 +84,37 @@ async def _ensure_run_active(
         raise WorkflowLimitReached(state, "time_limit")
 
 
+async def _pause_if_requested(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    state: WorkflowState,
+) -> None:
+    run = await session.get(AgentRun, run_id)
+    if run is None:
+        raise LookupError("Agent run not found")
+    await session.refresh(run)
+    if run.status != "pause_requested":
+        return
+    paused_state = {**state, "paused": True}
+    run.status = "paused"
+    await session.commit()
+    await persist_checkpoint(session, run_id=run_id, key="paused", state=paused_state)
+    await emit_event(
+        session,
+        run_id=run_id,
+        agent_name="aether_core",
+        event_type="workflow.paused",
+        payload={"status": "paused", "step_index": state.get("step_index", 0)},
+    )
+    raise WorkflowPaused(paused_state)
+
+
 def _update_usage(state: WorkflowState, completion: dict[str, Any]) -> WorkflowState:
     updated = dict(state)
     usage = completion.get("usage")
     if not isinstance(usage, dict):
+        updated["usage"] = state.get("usage") or None
         return updated
 
     totals = dict(state.get("usage") or {})
@@ -106,6 +139,7 @@ async def _complete_with_limits(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
     response_format: dict[str, str] | None = None,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[dict[str, Any], WorkflowState]:
     await _ensure_run_active(session, run_id=run.id, state=state)
     if state.get("model_calls", 0) >= settings.agent_max_model_calls:
@@ -125,35 +159,90 @@ async def _complete_with_limits(
         key="workflow-budget",
         state=call_state,
     )
+    await emit_event(
+        session,
+        run_id=run.id,
+        agent_name=state.get("selected_agent", "aether_core"),
+        event_type="usage.updated",
+        payload={
+            "model_calls": call_state.get("model_calls", 0),
+            "usage": call_state.get("usage") or {},
+            "reported_cost_limit_usd": settings.agent_max_cost_usd,
+            "model": state["model_id"],
+        },
+    )
+    delta_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def enqueue_delta(text: str) -> None:
+        await delta_queue.put(text)
+
     completion_task = asyncio.create_task(
         client.complete(
             model=state["model_id"],
             messages=messages,
             tools=tools,
             response_format=response_format,
+            on_text_delta=enqueue_delta if on_text_delta is not None else None,
         )
     )
+    delta_task = asyncio.create_task(delta_queue.get()) if on_text_delta is not None else None
     try:
         while True:
             elapsed = time.monotonic() - state.get("attempt_started_at", time.monotonic())
             remaining = settings.agent_max_run_seconds - elapsed
             if remaining <= 0:
                 raise WorkflowLimitReached(state, "time_limit")
+            wait_tasks = {completion_task}
+            if delta_task is not None:
+                wait_tasks.add(delta_task)
             completed, _ = await asyncio.wait(
-                {completion_task},
+                wait_tasks,
                 timeout=min(remaining, 0.5),
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if delta_task is not None and delta_task in completed:
+                await on_text_delta(delta_task.result())
+                delta_task = asyncio.create_task(delta_queue.get())
             if completion_task in completed:
+                if delta_task is not None:
+                    delta_task.cancel()
+                    await asyncio.gather(delta_task, return_exceptions=True)
+                    delta_task = None
+                while not delta_queue.empty():
+                    await on_text_delta(delta_queue.get_nowait())
                 completion = completion_task.result()
                 break
             await _ensure_run_active(session, run_id=run.id, state=call_state)
     except (WorkflowCancelled, WorkflowLimitReached):
         completion_task.cancel()
-        await asyncio.gather(completion_task, return_exceptions=True)
+        if delta_task is not None:
+            delta_task.cancel()
+        await asyncio.gather(
+            completion_task,
+            *([delta_task] if delta_task is not None else []),
+            return_exceptions=True,
+        )
         raise
     except asyncio.CancelledError:
         completion_task.cancel()
-        await asyncio.gather(completion_task, return_exceptions=True)
+        if delta_task is not None:
+            delta_task.cancel()
+        await asyncio.gather(
+            completion_task,
+            *([delta_task] if delta_task is not None else []),
+            return_exceptions=True,
+        )
+        raise
+    except Exception:
+        if not completion_task.done():
+            completion_task.cancel()
+        if delta_task is not None:
+            delta_task.cancel()
+        await asyncio.gather(
+            completion_task,
+            *([delta_task] if delta_task is not None else []),
+            return_exceptions=True,
+        )
         raise
 
     updated_state = _update_usage(call_state, completion)
@@ -165,6 +254,19 @@ async def _complete_with_limits(
         key="workflow-budget",
         state=updated_state,
     )
+    await emit_event(
+        session,
+        run_id=run.id,
+        agent_name=state.get("selected_agent", "aether_core"),
+        event_type="usage.updated",
+        payload={
+            "model_calls": updated_state.get("model_calls", 0),
+            "usage": updated_state.get("usage") or {},
+            "reported_cost_limit_usd": settings.agent_max_cost_usd,
+            "model": state["model_id"],
+        },
+    )
+    await _pause_if_requested(session, run_id=run.id, state=updated_state)
     return completion, updated_state
 
 
@@ -194,7 +296,11 @@ def _partial_answer(state: WorkflowState, *, reason: str) -> str:
     return f"{explanation}\n\nLangkah yang sudah selesai:\n{details}" if details else explanation
 
 
-def build_workflow(session: AsyncSession, client: OpenRouterClient):
+def build_workflow(
+    session: AsyncSession,
+    client: OpenRouterClient,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+):
     async def supervisor(state: WorkflowState) -> WorkflowState:
         selected = select_agent(state["request"])
         role: ModelRole = "coding" if selected == "developer" else state.get("model_role", "general")
@@ -218,7 +324,12 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
             run_id=state["run_id"],
             agent_name="aether_core",
             event_type="agent.status",
-            payload={"agent": selected, "status": "routed", "description": AGENT_DESCRIPTIONS[selected]},
+            payload={
+                "agent": selected,
+                "status": "routed",
+                "description": AGENT_DESCRIPTIONS[selected],
+                "route_basis": route_basis(state["request"], selected),
+            },
         )
         return next_state
 
@@ -384,6 +495,7 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                     state=step_state,
                     messages=request_messages,
                     tools=tool_definitions,
+                    on_text_delta=on_text_delta,
                 )
                 working_state = {
                     key: value
@@ -391,6 +503,15 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                     if key not in {"pending_completion", "resume_messages"}
                 }
             latest_completion = completion
+            await _pause_if_requested(
+                session,
+                run_id=state["run_id"],
+                state={
+                    **working_state,
+                    "pending_completion": completion,
+                    "resume_messages": request_messages,
+                },
+            )
             tool_count_in_step = 0
             while completion.get("tool_calls"):
                 if (
@@ -406,6 +527,8 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                 run = await session.get(AgentRun, state["run_id"])
                 if run is None:
                     raise LookupError("Agent run not found")
+                function = tool_call.get("function")
+                tool_name = function.get("name") if isinstance(function, dict) else "unknown"
                 try:
                     tool_result = await execute_tool_call(
                         session=session,
@@ -420,7 +543,11 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                         run_id=state["run_id"],
                         agent_name=agent,
                         event_type="tool.failed",
-                        payload={"status": "failed", "error": "Local browser unavailable"},
+                        payload={
+                            "tool": tool_name,
+                            "status": "failed",
+                            "error": "Local browser unavailable",
+                        },
                     )
                     raise OpenRouterError("browser_unavailable", "Aether's local browser is unavailable.") from None
                 except PermissionError:
@@ -429,7 +556,11 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                         run_id=state["run_id"],
                         agent_name=agent,
                         event_type="tool.failed",
-                        payload={"status": "failed", "error": "Tool permission denied"},
+                        payload={
+                            "tool": tool_name,
+                            "status": "failed",
+                            "error": "Tool permission denied",
+                        },
                     )
                     raise OpenRouterError("invalid_response", "The requested action is not permitted.") from None
                 except (ValueError, TypeError):
@@ -438,7 +569,11 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                         run_id=state["run_id"],
                         agent_name=agent,
                         event_type="tool.failed",
-                        payload={"status": "failed", "error": "Tool arguments were invalid"},
+                        payload={
+                            "tool": tool_name,
+                            "status": "failed",
+                            "error": "Tool arguments were invalid",
+                        },
                     )
                     raise OpenRouterError("invalid_response", "The AI requested an invalid tool action.") from None
 
@@ -508,6 +643,11 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                     key=f"tool-{tool_calls_total}-completed",
                     state=progress_state,
                 )
+                await _pause_if_requested(
+                    session,
+                    run_id=state["run_id"],
+                    state=progress_state,
+                )
                 run = await session.get(AgentRun, state["run_id"])
                 if run is None:
                     raise LookupError("Agent run not found")
@@ -518,6 +658,7 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                     state={**working_state, "resume_messages": request_messages},
                     messages=request_messages,
                     tools=tool_definitions,
+                    on_text_delta=on_text_delta,
                 )
                 working_state = {
                     key: value
@@ -555,7 +696,16 @@ def build_workflow(session: AsyncSession, client: OpenRouterClient):
                 run_id=state["run_id"],
                 agent_name=agent,
                 event_type="plan.step.completed",
-                payload={"index": step_index, "description": step["description"]},
+                payload={
+                    "index": step_index,
+                    "description": step["description"],
+                    "summary": result_text[:1200],
+                },
+            )
+            await _pause_if_requested(
+                session,
+                run_id=state["run_id"],
+                state=working_state,
             )
 
         final_answer = step_results[-1]["result"] if step_results else latest_completion.get("content", "")
@@ -597,6 +747,7 @@ async def run_workflow(
     client: OpenRouterClient,
     run: AgentRun,
     state: WorkflowState,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> WorkflowState:
     invocation_state: WorkflowState = {
         **state,
@@ -606,9 +757,19 @@ async def run_workflow(
         "step_results": state.get("step_results", []),
         "attempt_started_at": time.monotonic(),
     }
-    graph = build_workflow(session, client)
+    graph = build_workflow(session, client, on_text_delta=on_text_delta)
     try:
         return await graph.ainvoke(invocation_state)
+    except WorkflowPaused as exc:
+        paused_state = {
+            **exc.state,
+            "paused": True,
+            "answer": exc.state.get("answer", "Run dijeda pada checkpoint aman. Lanjutkan untuk meneruskan."),
+        }
+        run.status = "paused"
+        await session.commit()
+        await persist_checkpoint(session, run_id=run.id, key="paused", state=paused_state)
+        return paused_state
     except WorkflowCancelled as exc:
         cancelled_state = {
             **exc.state,

@@ -79,6 +79,49 @@ async def test_unauthorized_provider_response_is_not_retried(monkeypatch):
     assert attempts == 1
 
 
+@pytest.mark.asyncio
+async def test_streaming_completion_delivers_text_and_usage(monkeypatch):
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(settings, "openrouter_max_retries", 0)
+    chunks = [
+        {
+            "model": "stream-model",
+            "choices": [{"delta": {"content": "Hello ", "reasoning_details": [{"type": "opaque", "id": "r1"}]}}],
+        },
+        {"model": "stream-model", "choices": [{"delta": {"content": "world."}}]},
+        {
+            "model": "stream-model",
+            "choices": [],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10, "cost": 0.001},
+        },
+    ]
+    body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body.encode(),
+        )
+
+    deltas = []
+    client = OpenRouterClient(transport=httpx.MockTransport(handler))
+    result = await client.complete(
+        model="stream-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        on_text_delta=lambda value: _append_delta(deltas, value),
+    )
+    assert result["content"] == "Hello world."
+    assert result["reasoning_details"] == [{"type": "opaque", "id": "r1"}]
+    assert result["usage"]["total_tokens"] == 10
+    assert "".join(deltas) == "Hello world."
+
+
+async def _append_delta(deltas: list[str], value: str) -> None:
+    deltas.append(value)
+
+
 def test_model_router_uses_configured_model_assignments(monkeypatch):
     monkeypatch.setattr(settings, "primary_model", "primary-test")
     monkeypatch.setattr(settings, "coding_model", "coding-test")

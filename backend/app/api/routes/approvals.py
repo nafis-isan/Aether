@@ -23,7 +23,7 @@ from app.database.models import (
 )
 from app.schemas.approval import ApprovalDecision, ApprovalRead
 from app.schemas.chat import ChatResponse
-from app.services.workflow import emit_event, persist_checkpoint
+from app.services.workflow import emit_assistant_delta, emit_event, persist_checkpoint
 from app.tools.registry import CreateTaskInput
 
 router = APIRouter(prefix="/api/v1/approvals", tags=["approvals"])
@@ -203,7 +203,13 @@ async def decide_approval(
     resume_state.pop("pending_tool_call", None)
     resume_state.pop("continuation_messages", None)
     try:
-        completion = await run_workflow(session=session, client=openrouter, run=run, state=resume_state)
+        completion = await run_workflow(
+            session=session,
+            client=openrouter,
+            run=run,
+            state=resume_state,
+            on_text_delta=lambda text: emit_assistant_delta(session, run_id=run.id, text=text),
+        )
     except OpenRouterError as exc:
         raise HTTPException(
             status_code=provider_http_status(exc),

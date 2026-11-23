@@ -43,6 +43,26 @@ the run's checkpoints; cancelled runs are terminal and cannot be resumed.
 Failed runs can resume from their latest worker/tool checkpoint without
 restarting already completed plan steps.
 
+## Live visibility and controls
+
+The chat workspace receives assistant text deltas over the authenticated,
+conversation-scoped WebSocket event stream. It also displays provider-reported
+prompt/completion/total tokens and cost as `usage.updated` events arrive.
+Unavailable cost reporting is shown as unavailable; it is not estimated.
+Validated tool arguments and bounded output previews are stored in the event
+trail so the owner can inspect each tool's inputs and outputs.
+
+The process summary displays only observable routing rules, plan steps, and
+completed step results. It intentionally does not expose raw model reasoning
+traces. Tool inputs and outputs may include page content when browser sharing
+is enabled, and are visible only to the conversation owner.
+
+Pause requests take effect at a safe checkpoint after the active model call or
+tool finishes. The saved checkpoint can be resumed. Redirecting stops the
+current run, starts a new run with the new objective, and includes only the
+completed step results from the previous run as context. The old run remains
+in the event history as cancelled; it is not rewritten or rolled back.
+
 ## Available browser research
 
 When local browser automation and page sharing are both explicitly enabled,

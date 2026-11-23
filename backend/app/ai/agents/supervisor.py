@@ -24,3 +24,13 @@ def select_agent(request: str) -> AgentName:
         if any(phrase in normalized for phrase in phrases):
             return agent
     return "assistant"
+
+
+def route_basis(request: str, selected: AgentName) -> str:
+    normalized = request.casefold()
+    for agent, phrases in _ROUTES:
+        if agent == selected:
+            matched = next((phrase for phrase in phrases if phrase in normalized), None)
+            if matched is not None:
+                return f"Matched request phrase: '{matched}'."
+    return "No specialist routing phrase matched; the general assistant was selected."

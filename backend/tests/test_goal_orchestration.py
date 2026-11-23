@@ -108,6 +108,19 @@ async def test_multi_step_goal_is_planned_and_uses_previous_step_result(client, 
         assert checkpoint is not None
         assert event_types.count("plan.step.started") == 2
         assert event_types.count("plan.step.completed") == 2
+        tool_events = list(
+            await session.scalars(
+                select(AgentEvent)
+                .where(
+                    AgentEvent.agent_run_id == run.id,
+                    AgentEvent.event_type.in_(("tool.started", "tool.completed")),
+                )
+                .order_by(AgentEvent.sequence)
+            )
+        )
+        assert tool_events[0].payload["input"] == {"expression": "2 + 3"}
+        assert tool_events[1].payload["output"] == {"value": 5}
+        assert "usage.updated" in event_types
 
 
 @pytest.mark.asyncio
@@ -333,3 +346,116 @@ async def test_stop_cancels_an_in_flight_model_request(client, monkeypatch):
             )
         )
         assert "workflow.cancelled" in event_types
+
+
+@pytest.mark.asyncio
+async def test_pause_waits_for_model_checkpoint_and_resume_continues(client, monkeypatch):
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(settings, "openrouter_max_retries", 0)
+    request_started = asyncio.Event()
+    release_request = asyncio.Event()
+    call_count = 0
+
+    class CheckpointTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            request_started.set()
+            await release_request.wait()
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"role": "assistant", "content": "Checkpoint result."}}]},
+            )
+
+    monkeypatch.setattr(chat_route, "openrouter", OpenRouterClient(transport=CheckpointTransport()))
+    headers = await _auth_headers(client, "pause-run@example.com")
+    chat_task = asyncio.create_task(
+        client.post("/api/v1/chat", headers=headers, json={"message": "Pause this request"})
+    )
+    await asyncio.wait_for(request_started.wait(), timeout=5)
+
+    async with app.state.test_session_factory() as session:
+        run = await session.scalar(select(AgentRun).where(AgentRun.status == "running"))
+        assert run is not None
+        run_id = run.id
+
+    paused = await client.post(f"/api/v1/agents/runs/{run_id}/pause", headers=headers)
+    assert paused.status_code == 202
+    release_request.set()
+    chat_response = await asyncio.wait_for(chat_task, timeout=5)
+    assert chat_response.status_code == 200
+    async with app.state.test_session_factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run.status == "paused"
+        assert "paused" in list(
+            await session.scalars(
+                select(AgentCheckpoint.checkpoint_key).where(AgentCheckpoint.agent_run_id == run_id)
+            )
+        )
+
+    resumed = await client.post(f"/api/v1/agents/runs/{run_id}/resume", headers=headers)
+    assert resumed.status_code == 200
+    assert resumed.json()["reply"] == "Checkpoint result."
+    assert call_count == 1
+    async with app.state.test_session_factory() as session:
+        run = await session.get(AgentRun, run_id)
+        assert run.status == "completed"
+        event_types = list(
+            await session.scalars(
+                select(AgentEvent.event_type).where(AgentEvent.agent_run_id == run_id)
+            )
+        )
+        assert "workflow.paused" in event_types
+        assert "workflow.completed" in event_types
+
+
+@pytest.mark.asyncio
+async def test_redirect_stops_current_run_and_starts_new_objective(client, monkeypatch):
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(settings, "openrouter_max_retries", 0)
+    request_started = asyncio.Event()
+    cancelled = asyncio.Event()
+    call_count = 0
+
+    class RedirectTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                request_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"role": "assistant", "content": "Redirected result."}}]},
+            )
+
+    monkeypatch.setattr(chat_route, "openrouter", OpenRouterClient(transport=RedirectTransport()))
+    headers = await _auth_headers(client, "redirect-run@example.com")
+    original_request = asyncio.create_task(
+        client.post("/api/v1/chat", headers=headers, json={"message": "Start the original goal"})
+    )
+    await asyncio.wait_for(request_started.wait(), timeout=5)
+    async with app.state.test_session_factory() as session:
+        original_run = await session.scalar(select(AgentRun).where(AgentRun.status == "running"))
+        assert original_run is not None
+        original_run_id = original_run.id
+
+    redirected = await client.post(
+        f"/api/v1/agents/runs/{original_run_id}/redirect",
+        headers=headers,
+        json={"message": "Do this instead"},
+    )
+    assert redirected.status_code == 200
+    assert redirected.json()["reply"] == "Redirected result."
+    assert redirected.json()["run_id"] != original_run_id
+    assert cancelled.is_set()
+    assert (await original_request).status_code == 200
+    async with app.state.test_session_factory() as session:
+        previous = await session.get(AgentRun, original_run_id)
+        new_run = await session.get(AgentRun, redirected.json()["run_id"])
+        assert previous.status == "cancelled"
+        assert new_run.status == "completed"

@@ -150,6 +150,13 @@ class ToolResult:
     pending_approval_id: str | None = None
 
 
+def _event_value(value: Any, *, max_chars: int = 8000) -> Any:
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized) <= max_chars:
+        return value
+    return {"preview": serialized[:max_chars], "truncated": True}
+
+
 def tool_definitions_for(agent_name: str) -> list[dict[str, Any]]:
     return [
         {
@@ -279,7 +286,11 @@ async def execute_tool_call(
         run_id=run.id,
         agent_name=agent_name,
         event_type="tool.started",
-        payload={"tool": tool_name, "status": "started"},
+        payload={
+            "tool": tool_name,
+            "status": "started",
+            "input": _event_value(arguments, max_chars=4000),
+        },
     )
 
     if tool_name == "calculator":
@@ -375,6 +386,10 @@ async def execute_tool_call(
         run_id=run.id,
         agent_name=agent_name,
         event_type="tool.completed",
-        payload={"tool": tool_name, "status": "completed"},
+        payload={
+            "tool": tool_name,
+            "status": "completed",
+            "output": _event_value(result, max_chars=8000),
+        },
     )
     return ToolResult(output=result)

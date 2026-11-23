@@ -22,6 +22,29 @@ class ChatRequest(BaseModel):
         return value
 
 
+class ConversationCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=80)
+
+    @field_validator("title")
+    @classmethod
+    def reject_blank_title(cls, value: str) -> str:
+        title = value.strip()
+        if not title:
+            raise ValueError("Conversation title cannot be blank")
+        return title
+
+
+class RunRedirectRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=12_000)
+
+    @field_validator("message")
+    @classmethod
+    def reject_blank_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Message cannot be blank")
+        return value
+
+
 class ChatResponse(BaseModel):
     conversation_id: UUID
     reply: str

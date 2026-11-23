@@ -46,7 +46,14 @@ type ActivityEvent = {
 type PlanProgress = {
   index: number;
   description: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'stopped';
+  status: 'pending' | 'in_progress' | 'completed' | 'stopped' | 'paused';
+};
+
+type UsageTotals = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cost?: number;
 };
 
 type AgentDefinition = {
@@ -126,6 +133,10 @@ const draft = ref('');
 const modelRole = ref<'general' | 'coding'>('general');
 const busy = ref(false);
 const isStoppingRun = ref(false);
+const isPausingRun = ref(false);
+const isResumingRun = ref(false);
+const isRedirectingRun = ref(false);
+const streamedReply = ref('');
 const errorMessage = ref('');
 const backendStatus = ref<'checking' | 'connected' | 'unavailable'>('checking');
 const backendHealthError = ref('');
@@ -201,7 +212,7 @@ const displayMessages = computed<ChatMessage[]>(() => {
     {
       id: 'pending-assistant-message',
       role: 'assistant',
-      content: '',
+      content: streamedReply.value,
       created_at: new Date().toISOString(),
       pending: true
     }
@@ -210,6 +221,27 @@ const displayMessages = computed<ChatMessage[]>(() => {
 
 function renderMessageMarkdown(content: string): string {
   return markdown.render(content);
+}
+
+function formatRunValue(value: unknown): string {
+  return JSON.stringify(value ?? {}, null, 2);
+}
+
+function stepSummary(index: number): string {
+  const summary = currentRunEvents.value
+    .filter((event) => event.type === 'plan.step.completed' && event.data.index === index)
+    .at(-1)?.data.summary;
+  return typeof summary === 'string' ? summary : '';
+}
+
+function formatUsageCount(value: number | undefined): string {
+  return typeof value === 'number' ? new Intl.NumberFormat('id-ID').format(value) : '—';
+}
+
+function formatReportedCost(value: number | undefined): string {
+  return typeof value === 'number'
+    ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 }).format(value)
+    : 'Tidak dilaporkan';
 }
 
 const currentRunEvents = computed(() => {
@@ -238,16 +270,44 @@ const currentPlanProgress = computed<PlanProgress[]>(() => {
     const latestStepEvent = stepEvents.at(-1);
     const runStopped = ['workflow.failed', 'workflow.cancelled', 'workflow.limited']
       .includes(currentRunEvents.value.at(-1)?.type || '');
+    const runPaused = currentRunEvents.value.at(-1)?.type === 'workflow.paused';
     return [{
       index,
       description,
       status: latestStepEvent?.type === 'plan.step.completed'
         ? 'completed'
         : latestStepEvent?.type === 'plan.step.started'
-          ? runStopped ? 'stopped' : 'in_progress'
+          ? runPaused ? 'paused' : runStopped ? 'stopped' : 'in_progress'
           : 'pending'
     }];
   });
+});
+
+const currentUsage = computed(() => {
+  const usageEvent = currentRunEvents.value.filter((event) => event.type === 'usage.updated').at(-1);
+  const rawUsage = usageEvent?.data.usage;
+  const usage = typeof rawUsage === 'object' && rawUsage !== null ? rawUsage as UsageTotals : {};
+  const modelCalls = usageEvent?.data.model_calls;
+  const costLimit = usageEvent?.data.reported_cost_limit_usd;
+  return {
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+    reportedCost: usage.cost,
+    modelCalls: typeof modelCalls === 'number' ? modelCalls : undefined,
+    costLimit: typeof costLimit === 'number' ? costLimit : undefined
+  };
+});
+
+const currentToolEvents = computed(() => currentRunEvents.value.filter((event) =>
+  ['tool.started', 'tool.completed', 'tool.failed'].includes(event.type)
+));
+
+const currentRouteExplanation = computed(() => {
+  const basis = currentRunEvents.value
+    .filter((event) => event.type === 'agent.status' && event.data.status === 'routed')
+    .at(-1)?.data.route_basis;
+  return typeof basis === 'string' ? basis : '';
 });
 
 const isWorkflowActive = computed(() => {
@@ -257,10 +317,13 @@ const isWorkflowActive = computed(() => {
     'workflow.completed',
     'workflow.failed',
     'workflow.cancelled',
-    'workflow.limited'
+    'workflow.limited',
+    'workflow.paused'
   ].includes(latestEvent.type)
     && latestEvent.data.status !== 'waiting_approval';
 });
+
+const isWorkflowPaused = computed(() => currentRunEvents.value.at(-1)?.type === 'workflow.paused');
 
 const currentRouteEvent = computed(() => currentRunEvents.value
   .filter((event) => event.type === 'agent.status' && event.data.status === 'routed')
@@ -278,6 +341,9 @@ const currentRunStatus = computed(() => {
   if (latestEvent.type === 'workflow.cancelled') return 'Dihentikan';
   if (latestEvent.type === 'workflow.limited') return 'Batas eksekusi tercapai';
   if (latestEvent.type === 'workflow.stop_requested') return 'Menghentikan run…';
+  if (latestEvent.type === 'workflow.pause_requested') return 'Menunggu checkpoint untuk jeda';
+  if (latestEvent.type === 'workflow.paused') return 'Dijeda';
+  if (latestEvent.data.status === 'resuming') return 'Melanjutkan run';
   if (latestEvent.data.status === 'waiting_approval') return 'Menunggu persetujuan';
   if (latestEvent.type === 'workflow.completed') return 'Selesai';
   if (latestEvent.type === 'agent.started' && latestEvent.data.agent === 'aether_core') return 'Core memproses';
@@ -334,7 +400,10 @@ const agentActivities = computed<AgentActivity[]>(() => {
   return activities;
 });
 
-const latestActivity = computed(() => currentRunEvents.value.slice(-4).reverse());
+const latestActivity = computed(() => currentRunEvents.value
+  .filter((event) => event.type !== 'assistant.delta' && event.type !== 'usage.updated')
+  .slice(-4)
+  .reverse());
 
 function agentDisplayName(agentId: unknown): string {
   if (typeof agentId !== 'string') return 'Agent';
@@ -354,10 +423,18 @@ function activityDescription(event: ActivityEvent): string {
   if (event.type === 'plan.step.started') return `Mulai langkah ${String(event.data.index || '')}`;
   if (event.type === 'plan.step.completed') return `Menyelesaikan langkah ${String(event.data.index || '')}`;
   if (event.type === 'workflow.stop_requested') return 'Permintaan berhenti diterima';
+  if (event.type === 'workflow.pause_requested') return 'Menunggu checkpoint aman untuk jeda';
+  if (event.type === 'workflow.paused') return 'Run dijeda pada checkpoint aman';
+  if (event.type === 'workflow.redirected') return 'Memulai run baru dari instruksi yang dialihkan';
+  if (event.data.status === 'resuming') return 'Melanjutkan dari checkpoint';
   if (event.type === 'workflow.cancelled') return 'Run dihentikan';
   if (event.type === 'workflow.limited') return 'Run berhenti pada batas eksekusi';
   if (event.type === 'agent.started') return 'Mulai bekerja';
   if (event.type === 'agent.completed') return 'Menyelesaikan tugas';
+  if (event.type === 'tool.started') return `Menjalankan ${String(event.data.tool || 'tool')}`;
+  if (event.type === 'tool.completed') return `Selesai ${String(event.data.tool || 'tool')}`;
+  if (event.type === 'tool.failed') return `Gagal ${String(event.data.tool || 'tool')}`;
+  if (event.type === 'usage.updated') return 'Memperbarui penggunaan token/biaya';
   if (event.type === 'agent.status' && event.data.status === 'waiting_approval') return 'Menunggu persetujuan';
   if (event.type === 'approval.required') return 'Persetujuan tindakan diperlukan';
   if (event.type === 'workflow.completed') return 'Alur kerja selesai';
@@ -528,6 +605,9 @@ function openActivitySocket(generation: number): void {
         .sort((left, right) => left.created_at.localeCompare(right.created_at)
           || (left.run_id === right.run_id ? left.sequence - right.sequence : 0))
         .slice(-200);
+      if (event.type === 'assistant.delta' && typeof event.data.text === 'string') {
+        streamedReply.value += event.data.text;
+      }
       if (event.type === 'approval.required') {
         void loadApprovals().catch((error: unknown) => {
           errorMessage.value = getErrorMessage(error);
@@ -670,13 +750,25 @@ async function openConversation(conversationId: string): Promise<void> {
 
 async function sendMessage(): Promise<void> {
   const message = draft.value.trim();
-  if (!message || busy.value) {
+  if (!message) return;
+  if (isWorkflowPaused.value || (busy.value && isWorkflowActive.value)) {
+    await redirectCurrentRun(message);
     return;
   }
+  if (busy.value) return;
   errorMessage.value = '';
   pendingMessage.value = message;
   busy.value = true;
   try {
+    if (!activeConversationId.value) {
+      const conversation = await $fetch<Conversation>(`${apiBase}/conversations`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: { title: message.split('\n')[0].slice(0, 80) || 'New conversation' }
+      });
+      activeConversationId.value = conversation.id;
+    }
+    streamedReply.value = '';
     const response = await $fetch<ChatResponse>(`${apiBase}/chat`, {
       method: 'POST',
       headers: authHeaders(),
@@ -700,11 +792,83 @@ async function sendMessage(): Promise<void> {
   } catch (error) {
     errorMessage.value = getErrorMessage(error);
   } finally {
-    busy.value = false;
-    pendingMessage.value = '';
+    if (!isRedirectingRun.value) {
+      busy.value = false;
+      pendingMessage.value = '';
+    }
     if (!isListening.value && !window.speechSynthesis?.speaking) {
       voiceStatus.value = '';
     }
+  }
+}
+
+async function pauseCurrentRun(): Promise<void> {
+  const runId = currentRunEvents.value[0]?.run_id;
+  if (!runId || isPausingRun.value) return;
+  errorMessage.value = '';
+  isPausingRun.value = true;
+  try {
+    await $fetch(`${apiBase}/agents/runs/${runId}/pause`, {
+      method: 'POST',
+      headers: authHeaders()
+    });
+  } catch (error) {
+    errorMessage.value = getErrorMessage(error);
+  } finally {
+    isPausingRun.value = false;
+  }
+}
+
+async function resumeCurrentRun(): Promise<void> {
+  const runId = currentRunEvents.value[0]?.run_id;
+  if (!runId || isResumingRun.value) return;
+  errorMessage.value = '';
+  isResumingRun.value = true;
+  busy.value = true;
+  streamedReply.value = '';
+  try {
+    const response = await $fetch<ChatResponse>(`${apiBase}/agents/runs/${runId}/resume`, {
+      method: 'POST',
+      headers: authHeaders()
+    });
+    activeConversationId.value = response.conversation_id;
+    await Promise.all([loadConversations(), openConversation(response.conversation_id)]);
+  } catch (error) {
+    errorMessage.value = getErrorMessage(error);
+  } finally {
+    isResumingRun.value = false;
+    busy.value = false;
+  }
+}
+
+async function redirectCurrentRun(message: string): Promise<void> {
+  const runId = currentRunEvents.value[0]?.run_id;
+  if (!runId || isRedirectingRun.value) return;
+  errorMessage.value = '';
+  isRedirectingRun.value = true;
+  busy.value = true;
+  pendingMessage.value = message;
+  streamedReply.value = '';
+  try {
+    const response = await $fetch<ChatResponse>(`${apiBase}/agents/runs/${runId}/redirect`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: { message }
+    });
+    draft.value = '';
+    pendingMessage.value = '';
+    activeConversationId.value = response.conversation_id;
+    await Promise.all([
+      loadConversations(),
+      openConversation(response.conversation_id),
+      response.pending_approval_id ? loadApprovals() : Promise.resolve()
+    ]);
+  } catch (error) {
+    errorMessage.value = getErrorMessage(error);
+  } finally {
+    isRedirectingRun.value = false;
+    busy.value = false;
+    pendingMessage.value = '';
   }
 }
 
@@ -858,6 +1022,7 @@ function signOut(): void {
 watch(activeConversationId, () => {
   activityEvents.value = [];
   eventCursors.value = {};
+  streamedReply.value = '';
 });
 watch([token, activeConversationId, localAuthMode], connectActivity);
 onMounted(() => {
@@ -1039,9 +1204,9 @@ onBeforeUnmount(() => {
             <div class="composer-wrap">
               <p v-if="errorMessage" class="error-message chat-error" role="alert">{{ errorMessage }}</p>
               <form class="composer" @submit.prevent="sendMessage">
-                <textarea ref="composerInput" v-model="draft" :disabled="busy" maxlength="12000" rows="2" aria-label="Pesan untuk Aether" placeholder="Tulis pesan untuk Aether..." @keydown.enter.exact.prevent="sendMessage" />
+                <textarea ref="composerInput" v-model="draft" maxlength="12000" rows="2" aria-label="Pesan untuk Aether" :placeholder="isWorkflowActive ? 'Tulis untuk mengalihkan tujuan run...' : 'Tulis pesan untuk Aether...'" @keydown.enter.exact.prevent="sendMessage" />
                 <div class="composer-footer">
-                  <span>{{ busy ? 'Permintaan sedang diproses · Respons tidak di-stream.' : 'Enter untuk mengirim · Shift + Enter untuk baris baru' }}</span>
+                  <span>{{ isWorkflowActive ? 'Respons mengalir · Kirim pesan untuk mengalihkan tujuan.' : 'Enter untuk mengirim · Shift + Enter untuk baris baru' }}</span>
                   <div class="composer-actions">
                     <label class="inline-model-select">
                       <span class="visually-hidden">Pilih model · {{ modelDetails.provider }}</span>
@@ -1073,6 +1238,13 @@ onBeforeUnmount(() => {
                     </button>
                     <button
                       v-if="busy && isWorkflowActive"
+                      class="pause-button"
+                      type="button"
+                      :disabled="isPausingRun"
+                      @click="pauseCurrentRun"
+                    >{{ isPausingRun ? 'Menjeda…' : 'Jeda' }}</button>
+                    <button
+                      v-if="busy && isWorkflowActive"
                       class="stop-button"
                       type="button"
                       :disabled="isStoppingRun"
@@ -1080,8 +1252,8 @@ onBeforeUnmount(() => {
                     >
                       {{ isStoppingRun ? 'Menghentikan…' : 'Hentikan' }}
                     </button>
-                    <button class="send-button" type="submit" :disabled="busy || !draft.trim()">
-                      {{ busy ? 'Memproses…' : 'Kirim ↑' }}
+                    <button class="send-button" type="submit" :disabled="!draft.trim() || (busy && !isWorkflowActive)">
+                      {{ isRedirectingRun ? 'Mengalihkan…' : isWorkflowActive || isWorkflowPaused ? 'Alihkan →' : busy ? 'Memproses…' : 'Kirim ↑' }}
                     </button>
                   </div>
                 </div>
@@ -1110,6 +1282,15 @@ onBeforeUnmount(() => {
               <strong>{{ currentRunStatus }}</strong>
               <span v-if="currentRunEvents.length">RUN / {{ currentRunEvents[0].run_id.slice(0, 8) }}</span>
               <span v-else>{{ activeConversationId ? 'Menunggu event percakapan.' : 'Belum ada run.' }}</span>
+            </div>
+
+            <div v-if="currentRunEvents.length" class="usage-meter" aria-label="Penggunaan model">
+              <p class="agent-list-label">RUN USAGE</p>
+              <div><span>Token</span><strong>{{ formatUsageCount(currentUsage.totalTokens ?? 0) }}</strong></div>
+              <div><span>Input / output</span><strong>{{ formatUsageCount(currentUsage.promptTokens ?? 0) }} / {{ formatUsageCount(currentUsage.completionTokens ?? 0) }}</strong></div>
+              <div><span>Panggilan model</span><strong>{{ formatUsageCount(currentUsage.modelCalls ?? 0) }}</strong></div>
+              <div><span>Biaya dilaporkan</span><strong>{{ formatReportedCost(currentUsage.reportedCost) }}</strong></div>
+              <small v-if="currentUsage.costLimit !== undefined">Batas biaya: {{ formatReportedCost(currentUsage.costLimit) }} · berdasarkan laporan provider</small>
             </div>
 
             <div class="orchestration-path" aria-label="Alur routing agent">
@@ -1141,10 +1322,46 @@ onBeforeUnmount(() => {
                   <span class="plan-step-index">{{ String(step.index).padStart(2, '0') }}</span>
                   <span class="plan-step-description">{{ step.description }}</span>
                   <span class="plan-step-status">
-                    {{ step.status === 'completed' ? 'Selesai' : step.status === 'in_progress' ? 'Berjalan' : step.status === 'stopped' ? 'Terhenti' : 'Menunggu' }}
+                    {{ step.status === 'completed' ? 'Selesai' : step.status === 'in_progress' ? 'Berjalan' : step.status === 'stopped' ? 'Terhenti' : step.status === 'paused' ? 'Dijeda' : 'Menunggu' }}
                   </span>
                 </li>
               </ol>
+            </div>
+
+            <details v-if="currentRouteExplanation || currentPlanProgress.length" class="process-summary">
+              <summary>Ringkasan proses</summary>
+              <p v-if="currentRouteExplanation"><strong>Alasan routing:</strong> {{ currentRouteExplanation }}</p>
+              <ol v-if="currentPlanProgress.length">
+                <li v-for="step in currentPlanProgress" :key="step.index">
+                  <strong>{{ step.description }}</strong>
+                  <span v-if="stepSummary(step.index)">{{ stepSummary(step.index) }}</span>
+                </li>
+              </ol>
+              <small>Ringkasan ini berdasarkan routing dan hasil langkah yang tercatat, bukan chain-of-thought internal.</small>
+            </details>
+
+            <div v-if="currentToolEvents.length" class="tool-event-details">
+              <p class="agent-list-label">TOOL DETAILS</p>
+              <details v-for="event in currentToolEvents" :key="event.event_id">
+                <summary>
+                  {{ String(event.data.tool || 'Tool') }} ·
+                  {{ event.type === 'tool.started' ? 'Dimulai' : event.type === 'tool.completed' ? 'Selesai' : 'Gagal' }}
+                </summary>
+                <template v-if="event.data.input !== undefined">
+                  <span>Input</span><pre>{{ formatRunValue(event.data.input) }}</pre>
+                </template>
+                <template v-if="event.data.output !== undefined">
+                  <span>Output</span><pre>{{ formatRunValue(event.data.output) }}</pre>
+                </template>
+                <p v-if="event.data.error" class="tool-error">{{ String(event.data.error) }}</p>
+              </details>
+            </div>
+
+            <div v-if="isWorkflowPaused" class="run-controls">
+              <p>Run berhenti sementara di checkpoint aman. Tidak ada langkah baru yang berjalan.</p>
+              <button type="button" :disabled="isResumingRun" @click="resumeCurrentRun">
+                {{ isResumingRun ? 'Melanjutkan…' : 'Lanjutkan run' }}
+              </button>
             </div>
 
             <div class="agent-directory">
@@ -1783,6 +2000,32 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .plan-progress li.in_progress .plan-step-status { color: #d3a64e; }
 .plan-progress li.completed .plan-step-status { color: #72dfbf; }
 .plan-progress li.stopped .plan-step-status { color: #ec9a82; }
+.plan-progress li.paused .plan-step-status { color: #d3a64e; }
+.pause-button { padding: 8px 10px; border: 1px solid #d3a64e66; border-radius: 6px; background: #30291c; color: #e8c77d; font-size: 9px; }
+.pause-button:hover:not(:disabled) { background: #41371f; }
+.usage-meter { display: grid; gap: 7px; margin-top: 14px; padding: 0 0 13px; border-bottom: 1px solid #ffffff12; }
+.usage-meter .agent-list-label { margin: 0; }
+.usage-meter > div { display: flex; justify-content: space-between; gap: 8px; color: #798593; font-size: 9px; }
+.usage-meter strong { color: #c8d1da; font-size: 9px; font-weight: 500; text-align: right; }
+.usage-meter small, .process-summary small { color: #687586; font-size: 8px; line-height: 1.5; }
+.process-summary { margin-top: 14px; color: #8995a2; font-size: 9px; line-height: 1.55; }
+.process-summary summary, .tool-event-details summary { color: #c1cbd4; cursor: pointer; }
+.process-summary > p { margin: 9px 0; }
+.process-summary ol { display: grid; gap: 9px; margin: 9px 0; padding-left: 17px; }
+.process-summary li strong, .process-summary li span { display: block; }
+.process-summary li strong { color: #b7c3ce; font-weight: 500; }
+.process-summary li span { margin-top: 3px; color: #7f8b98; overflow-wrap: anywhere; }
+.tool-event-details { display: grid; gap: 8px; margin-top: 14px; }
+.tool-event-details .agent-list-label { margin: 0; }
+.tool-event-details details { min-width: 0; padding: 8px; border: 1px solid #ffffff10; background: #0c1118; }
+.tool-event-details summary { overflow-wrap: anywhere; font-size: 9px; }
+.tool-event-details > details > span { display: block; margin-top: 9px; color: #788493; font-size: 8px; }
+.tool-event-details pre { max-height: 160px; overflow: auto; margin: 5px 0 0; padding: 7px; background: #080b10; color: #b6c6d0; font-size: 8px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-error { color: #ec9a82; font-size: 9px; }
+.run-controls { display: grid; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #ffffff12; }
+.run-controls p { margin: 0; color: #9aa5b2; font-size: 9px; line-height: 1.5; }
+.run-controls button { justify-self: start; padding: 8px 10px; border: 1px solid #72dfbf66; border-radius: 4px; background: #10251f; color: #96e5cc; font-size: 9px; }
+.run-controls button:hover:not(:disabled) { background: #18352b; }
 
 @media (max-width: 760px) {
   .topbar { height: 56px; padding: 0 16px; }
@@ -1800,6 +2043,7 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
   .chat-body.welcome-chat .voice-toggle,
   .chat-body.welcome-chat .voice-button,
   .chat-body.welcome-chat .stop-button,
+  .chat-body.welcome-chat .pause-button,
   .chat-body.welcome-chat .send-button { padding: 7px 6px; font-size: 8px; }
 }
 
