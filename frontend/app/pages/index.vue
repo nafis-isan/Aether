@@ -87,6 +87,8 @@ type Memory = {
 
 type WorkspaceView = 'chat' | 'memory';
 
+type AgentVisualStatus = 'idle' | 'thinking' | 'executing' | 'approval' | 'error';
+
 type SpeechRecognitionResultLike = {
   isFinal: boolean;
   0: { transcript: string };
@@ -145,6 +147,7 @@ const agentDefinitions = ref<AgentDefinition[]>([]);
 const activityStatus = ref<'disconnected' | 'connecting' | 'connected'>('disconnected');
 const eventCursors = ref<Record<string, number>>({});
 const approvals = ref<Approval[]>([]);
+const approvalModalId = ref<string | null>(null);
 const memories = ref<Memory[]>([]);
 const memoryContent = ref('');
 const memoryType = ref<Memory['memory_type']>('preference');
@@ -167,11 +170,31 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let activityGeneration = 0;
 let reconnectAttempt = 0;
 
-const suggestedPrompts = [
-  { category: 'Research', prompt: 'Bandingkan sumber dan temukan insight utama.' },
-  { category: 'Coding', prompt: 'Tinjau kode ini dan bantu telusuri bug.' },
-  { category: 'Produktivitas', prompt: 'Susun prioritas dan rencana kerja hari ini.' },
-  { category: 'Umum', prompt: 'Bantu kembangkan ide yang sedang saya pikirkan.' }
+const capabilities = [
+  {
+    name: 'Browser lokal',
+    icon: '↗',
+    detail: 'Perlu diaktifkan; navigasi dibatasi ke host allowlist.',
+    prompt: 'Buka halaman yang diizinkan dan rangkum informasi yang relevan.'
+  },
+  {
+    name: 'Tugas',
+    icon: '▦',
+    detail: 'Tinjau tugas; pembuatan tugas meminta persetujuan.',
+    prompt: 'Buat tugas untuk menyiapkan rencana kerja minggu ini.'
+  },
+  {
+    name: 'Kalkulator',
+    icon: 'ƒx',
+    detail: 'Hitung ekspresi aritmetika dengan batas aman.',
+    prompt: 'Hitung dan jelaskan hasil dari '
+  },
+  {
+    name: 'Perencanaan',
+    icon: '⌘',
+    detail: 'Uraikan tujuan menjadi langkah berurutan.',
+    prompt: 'Buat rencana langkah demi langkah untuk '
+  }
 ];
 
 const visibleMemories = computed(() => memories.value.filter((memory) => {
@@ -198,26 +221,25 @@ const modelDetails = computed(() => modelRole.value === 'general'
       provider: 'Cohere · OpenRouter',
       purpose: 'Pemrograman dan desain software'
     });
-const displayMessages = computed<ChatMessage[]>(() => {
-  if (!pendingMessage.value) return messages.value;
-  return [
-    ...messages.value,
-    {
-      id: 'pending-user-message',
-      role: 'user',
-      content: pendingMessage.value,
-      created_at: new Date().toISOString(),
-      pending: true
-    },
-    {
-      id: 'pending-assistant-message',
-      role: 'assistant',
-      content: streamedReply.value,
-      created_at: new Date().toISOString(),
-      pending: true
-    }
-  ];
+const hasStartedTask = computed(() => Boolean(activeConversationId.value || pendingMessage.value || messages.value.length));
+const latestAssistantOutput = computed(() => {
+  if (busy.value && pendingMessage.value) return streamedReply.value;
+  return [...messages.value].reverse().find((message) => message.role === 'assistant')?.content || streamedReply.value;
 });
+const conversationHistory = computed(() => {
+  const latestAssistant = !busy.value
+    ? [...messages.value].reverse().find((message) => message.role === 'assistant')
+    : undefined;
+  return latestAssistant
+    ? messages.value.filter((message) => message.id !== latestAssistant.id)
+    : messages.value;
+});
+const currentActivityEvents = computed(() => currentRunEvents.value.filter((event) =>
+  event.type !== 'assistant.delta' && event.type !== 'usage.updated'
+));
+const latestToolEvent = computed(() => currentToolEvents.value.at(-1));
+const isToolRunning = computed(() => latestToolEvent.value?.type === 'tool.started');
+const currentApprovalModal = computed(() => approvals.value.find((approval) => approval.id === approvalModalId.value) || null);
 
 function renderMessageMarkdown(content: string): string {
   return markdown.render(content);
@@ -352,6 +374,42 @@ const currentRunStatus = computed(() => {
   return latestEvent.type.replaceAll('.', ' ');
 });
 
+const agentVisualStatus = computed<AgentVisualStatus>(() => {
+  const latestEvent = currentRunEvents.value.at(-1);
+  if (
+    approvals.value.length > 0
+    || latestEvent?.data.status === 'waiting_approval'
+    || latestEvent?.type === 'approval.required'
+  ) {
+    return 'approval';
+  }
+  if (
+    latestEvent?.type === 'workflow.failed'
+    || latestEvent?.type === 'workflow.limited'
+    || latestEvent?.type === 'tool.failed'
+    || latestEvent?.data.status === 'failed'
+  ) {
+    return 'error';
+  }
+  if (isToolRunning.value) return 'executing';
+  if (isWorkflowActive.value) return 'thinking';
+  return 'idle';
+});
+
+const agentVisualLabel = computed(() => ({
+  idle: 'Aether siap menerima tujuan baru',
+  thinking: 'Aether sedang merencanakan',
+  executing: 'Aether sedang menjalankan tool',
+  approval: 'Aether menunggu persetujuan',
+  error: 'Run terakhir mengalami error'
+})[agentVisualStatus.value]);
+
+const workspaceContext = computed(() => {
+  if (workspaceView.value === 'memory') return 'Memory';
+  if (!hasStartedTask.value) return 'Workspace';
+  return conversations.value.find((conversation) => conversation.id === activeConversationId.value)?.title || 'Task';
+});
+
 const agentActivities = computed<AgentActivity[]>(() => {
   const displayNames: Record<string, string> = {
     assistant: 'Assistant',
@@ -400,11 +458,6 @@ const agentActivities = computed<AgentActivity[]>(() => {
   return activities;
 });
 
-const latestActivity = computed(() => currentRunEvents.value
-  .filter((event) => event.type !== 'assistant.delta' && event.type !== 'usage.updated')
-  .slice(-4)
-  .reverse());
-
 function agentDisplayName(agentId: unknown): string {
   if (typeof agentId !== 'string') return 'Agent';
   if (agentId === 'aether_core') return 'Aether Core';
@@ -440,6 +493,32 @@ function activityDescription(event: ActivityEvent): string {
   if (event.type === 'workflow.completed') return 'Alur kerja selesai';
   if (event.type === 'workflow.failed') return 'Alur kerja gagal';
   return event.type.replaceAll('.', ' ');
+}
+
+function activityTone(event: ActivityEvent): 'success' | 'running' | 'approval' | 'error' | 'neutral' {
+  if (['workflow.failed', 'workflow.limited', 'tool.failed'].includes(event.type) || event.data.status === 'failed') {
+    return 'error';
+  }
+  if (
+    event.type.startsWith('approval.')
+    || event.data.status === 'waiting_approval'
+    || event.type === 'workflow.paused'
+  ) {
+    return 'approval';
+  }
+  if (
+    ['workflow.completed', 'plan.step.completed', 'tool.completed', 'agent.completed'].includes(event.type)
+    || event.type === 'approval.approved'
+  ) {
+    return 'success';
+  }
+  if (
+    ['agent.started', 'plan.step.started', 'tool.started', 'workflow.stop_requested', 'workflow.pause_requested']
+      .includes(event.type)
+  ) {
+    return 'running';
+  }
+  return 'neutral';
 }
 
 function formatActivityTime(value: string): string {
@@ -553,11 +632,20 @@ async function loadConversations(): Promise<void> {
 async function loadApprovals(): Promise<void> {
   if (!token.value && !localAuthMode.value) {
     approvals.value = [];
+    approvalModalId.value = null;
     return;
   }
-  approvals.value = await $fetch<Approval[]>(`${apiBase}/approvals`, {
+  const knownIds = new Set(approvals.value.map((approval) => approval.id));
+  const updatedApprovals = await $fetch<Approval[]>(`${apiBase}/approvals`, {
     headers: authHeaders()
   });
+  approvals.value = updatedApprovals;
+  const newApproval = updatedApprovals.find((approval) => !knownIds.has(approval.id));
+  if (newApproval) {
+    approvalModalId.value = newApproval.id;
+  } else if (!updatedApprovals.some((approval) => approval.id === approvalModalId.value)) {
+    approvalModalId.value = null;
+  }
 }
 
 async function loadMemories(): Promise<void> {
@@ -672,6 +760,7 @@ async function decideApproval(approval: Approval, approve: boolean): Promise<voi
       headers: authHeaders(),
       body: { approve }
     });
+    approvalModalId.value = null;
     await Promise.all([loadApprovals(), loadConversations()]);
     activeConversationId.value = result.conversation_id;
     await openConversation(result.conversation_id);
@@ -1001,6 +1090,22 @@ function useSuggestedPrompt(prompt: string): void {
   void nextTick(() => composerInput.value?.focus());
 }
 
+function startNewTask(): void {
+  disconnectActivity();
+  workspaceView.value = 'chat';
+  activeConversationId.value = null;
+  messages.value = [];
+  pendingMessage.value = '';
+  streamedReply.value = '';
+  draft.value = '';
+  errorMessage.value = '';
+  void nextTick(() => composerInput.value?.focus());
+}
+
+function dismissApprovalModal(): void {
+  approvalModalId.value = null;
+}
+
 function signOut(): void {
   if (localAuthMode.value) {
     return;
@@ -1016,6 +1121,7 @@ function signOut(): void {
   memoryContent.value = '';
   errorMessage.value = '';
   approvals.value = [];
+  approvalModalId.value = null;
   memories.value = [];
 }
 
@@ -1040,9 +1146,13 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="app-shell">
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="Aether — beranda">
-        <img src="/aether-wordmark.png" alt="Aether" />
+    <header v-if="!authModeLoaded || (!localAuthMode && !token)" class="topbar standalone-topbar">
+      <a class="brand" href="/" aria-label="Aether — beranda" :title="agentVisualLabel">
+        <span class="brand-mark" :class="agentVisualStatus" aria-hidden="true">
+          <img src="/aether-monogram.png" alt="" />
+          <span v-if="agentVisualStatus === 'approval'" class="brand-approval-dot" />
+        </span>
+        <span class="brand-name">Aether</span>
       </a>
       <div class="topbar-right">
         <span class="backend-indicator" :class="backendStatus">
@@ -1098,7 +1208,14 @@ onBeforeUnmount(() => {
 
     <section v-else class="workspace">
       <aside class="sidebar">
-        <button class="new-chat" type="button" :disabled="busy" @click="activeConversationId = null; messages = []; errorMessage = ''">
+        <a class="brand sidebar-brand" href="/" aria-label="Aether — beranda" :title="agentVisualLabel">
+          <span class="brand-mark" :class="agentVisualStatus" aria-hidden="true">
+            <img src="/aether-monogram.png" alt="" />
+            <span v-if="agentVisualStatus === 'approval'" class="brand-approval-dot" />
+          </span>
+          <span class="brand-name">Aether</span>
+        </a>
+        <button class="new-chat" type="button" :disabled="busy" @click="startNewTask">
           <span aria-hidden="true">＋</span> Percakapan baru
         </button>
         <nav class="workspace-nav" aria-label="Workspace">
@@ -1107,7 +1224,7 @@ onBeforeUnmount(() => {
             :class="{ selected: workspaceView === 'chat' }"
             @click="workspaceView = 'chat'"
           >
-            <span aria-hidden="true">◌</span> Chat
+            <span aria-hidden="true">⌘</span> Workspace
           </button>
           <button
             type="button"
@@ -1120,7 +1237,7 @@ onBeforeUnmount(() => {
         </nav>
 
         <template v-if="workspaceView === 'chat'">
-          <p class="sidebar-heading">RIWAYAT</p>
+          <p class="sidebar-heading">RECENT TASKS</p>
           <label class="conversation-search">
             <span class="visually-hidden">Cari percakapan</span>
             <input v-model="conversationSearch" type="search" placeholder="Cari percakapan…" />
@@ -1139,11 +1256,11 @@ onBeforeUnmount(() => {
           <p v-if="conversations.length === 0" class="empty-history">Belum ada percakapan.</p>
           <p v-else-if="visibleConversations.length === 0" class="empty-history">Tidak ada percakapan yang cocok.</p>
 
-          <div class="sidebar-section-heading">
+          <div class="sidebar-section-heading approval-heading" :class="{ 'has-approvals': approvals.length > 0 }">
             <p class="sidebar-heading">PERSETUJUAN</p>
-            <span v-if="approvals.length" class="nav-count">{{ approvals.length }}</span>
+            <span class="approval-count">{{ approvals.length }}</span>
           </div>
-          <article v-for="approval in approvals" :key="approval.id" class="sidebar-card">
+          <article v-for="approval in approvals" :key="approval.id" class="sidebar-card approval-card">
             <p>{{ approval.tool_name === 'create_task' ? 'Buat tugas' : approval.tool_name }}</p>
             <span>{{ approval.tool_arguments.title || 'Tindakan memerlukan persetujuanmu.' }}</span>
             <div class="approval-actions">
@@ -1151,62 +1268,156 @@ onBeforeUnmount(() => {
               <button type="button" :disabled="busy" @click="decideApproval(approval, false)">Tolak</button>
             </div>
           </article>
-          <p v-if="approvals.length === 0" class="sidebar-empty">Tidak ada tindakan yang menunggu.</p>
+          <p v-if="approvals.length === 0" class="sidebar-empty approval-empty">Tidak ada tindakan yang menunggu.</p>
         </template>
       </aside>
 
-      <section v-if="workspaceView === 'chat'" class="chat-area">
-        <div v-if="activeConversationId" class="chat-heading">
-          <div>
-            <p class="eyebrow">AETHER / CONVERSATION</p>
-            <h1>{{ conversations.find((item) => item.id === activeConversationId)?.title || 'Percakapan' }}</h1>
+      <div class="workspace-main">
+        <header class="workspace-topbar">
+          <div class="workspace-context">
+            <span>Aether</span>
+            <span class="context-divider" aria-hidden="true">/</span>
+            <strong>{{ workspaceContext }}</strong>
           </div>
-        </div>
+          <div class="topbar-right">
+            <span class="backend-indicator" :class="backendStatus">
+              <span class="indicator-dot" />
+              {{ backendStatus === 'connected' ? 'Backend tersambung' : backendStatus === 'checking' ? 'Memeriksa backend' : 'Backend tidak tersedia' }}
+            </span>
+            <span v-if="backendHealthError" class="backend-error" :title="backendHealthError">{{ backendHealthError }}</span>
+            <span v-if="user" class="user-label">{{ localAuthMode ? 'Mode lokal' : user.name }}</span>
+            <button v-if="user && !localAuthMode" class="sign-out" type="button" @click="signOut">Keluar</button>
+          </div>
+        </header>
 
-        <div class="chat-body" :class="{ 'welcome-chat': displayMessages.length === 0 }">
-          <section class="conversation-workspace" aria-label="Percakapan dengan Aether">
-            <div v-if="displayMessages.length === 0" class="welcome-state">
-              <div class="welcome-intro">
-                <img class="welcome-mark" src="/aether-monogram.png" alt="" />
-                <h2>Selamat datang,<br /><span>aku Aether.</span></h2>
-                <p>Apa yang bisa kubantu hari ini?</p>
+      <section v-if="workspaceView === 'chat'" class="chat-area">
+        <div class="task-workspace" :class="{ 'is-empty': !hasStartedTask }">
+          <section class="task-main" aria-label="Task workspace">
+            <div v-if="!hasStartedTask" class="task-landing-intro">
+              <p class="eyebrow">PERSONAL AI WORKSPACE</p>
+              <h2>Selamat datang,<br /><span>apa yang ingin kamu buat?</span></h2>
+              <p>Berpikir, merencanakan, dan berkarya lebih jernih bersama ruang kerja yang memahami caramu bekerja.</p>
+            </div>
+
+            <section v-else class="task-timeline-pane" aria-labelledby="timeline-title" aria-live="polite" :aria-busy="busy">
+              <header class="task-pane-heading">
+                <div>
+                  <p class="eyebrow">RUN / {{ currentRunEvents[0]?.run_id.slice(0, 8) || 'PENDING' }}</p>
+                  <h2 id="timeline-title">
+                    <span class="timeline-brain" :class="agentVisualStatus" aria-hidden="true">
+                      <img src="/aether-monogram.png" alt="" />
+                    </span>
+                    Task timeline
+                  </h2>
+                </div>
+                <span class="run-state" :class="isWorkflowActive ? 'running' : isWorkflowPaused ? 'approval' : currentRunEvents.at(-1)?.type === 'workflow.failed' ? 'error' : 'success'">
+                  <span class="status-dot" />
+                  {{ currentRunStatus }}
+                </span>
+              </header>
+
+              <div class="run-summary">
+                <div class="run-summary-copy">
+                  <span class="run-kicker">GOAL</span>
+                  <strong>{{ pendingMessage || conversations.find((item) => item.id === activeConversationId)?.title || 'Task berjalan' }}</strong>
+                </div>
+                <div v-if="currentRunEvents.length" class="run-usage-inline">
+                  <span>{{ formatUsageCount(currentUsage.totalTokens ?? 0) }} tokens</span>
+                  <span>{{ formatUsageCount(currentUsage.modelCalls ?? 0) }} calls</span>
+                </div>
               </div>
-              <div class="prompt-grid" aria-label="Saran percakapan">
-                <button
-                  v-for="suggestion in suggestedPrompts"
-                  :key="suggestion.category"
-                  class="prompt-card"
-                  type="button"
-                  :title="suggestion.prompt"
-                  @click="useSuggestedPrompt(suggestion.prompt)"
-                >
-                  <span class="prompt-icon" aria-hidden="true">{{ { Research: '⌕', Coding: '</>', Produktivitas: '◷', Umum: '✳' }[suggestion.category] }}</span>
-                  {{ suggestion.category }}
+
+              <div v-if="latestToolEvent" class="tool-activity" :class="{ running: isToolRunning, failed: latestToolEvent.type === 'tool.failed' }" role="status">
+                <span aria-hidden="true">⌁</span>
+                <strong>{{ isToolRunning ? 'Using Tool' : latestToolEvent.type === 'tool.failed' ? 'Tool failed' : 'Tool used' }}: {{ String(latestToolEvent.data.tool || 'tool') }}</strong>
+                <span>{{ isToolRunning ? 'Sedang berjalan' : latestToolEvent.type === 'tool.failed' ? 'Perlu diperiksa' : 'Selesai' }}</span>
+              </div>
+
+              <div v-if="currentPlanProgress.length" class="plan-progress" aria-label="Rencana eksekusi">
+                <p class="agent-list-label">EXECUTION PLAN</p>
+                <ol>
+                  <li v-for="step in currentPlanProgress" :key="step.index" :class="step.status">
+                    <span class="plan-step-index">{{ step.status === 'completed' ? '✓' : String(step.index).padStart(2, '0') }}</span>
+                    <span class="plan-step-description">{{ step.description }}</span>
+                    <span class="plan-step-status">
+                      {{ step.status === 'completed' ? 'Selesai' : step.status === 'in_progress' ? 'Berjalan' : step.status === 'stopped' ? 'Terhenti' : step.status === 'paused' ? 'Dijeda' : 'Menunggu' }}
+                    </span>
+                  </li>
+                </ol>
+              </div>
+
+              <div v-if="currentActivityEvents.length" class="task-event-log" aria-label="Log aktivitas run">
+                <p class="agent-list-label">ACTIVITY LOG</p>
+                <ol>
+                  <li v-for="event in currentActivityEvents" :key="event.event_id" :class="activityTone(event)">
+                    <span class="timeline-marker" aria-hidden="true">
+                      {{ activityTone(event) === 'success' ? '✓' : activityTone(event) === 'error' || activityTone(event) === 'approval' ? '!' : activityTone(event) === 'running' ? '·' : '—' }}
+                    </span>
+                    <time :datetime="event.created_at">{{ formatActivityTime(event.created_at) }}</time>
+                    <div class="timeline-entry">
+                      <strong>{{ activityDescription(event) }}</strong>
+                      <span>{{ activityActor(event) }}</span>
+                    </div>
+                  </li>
+                </ol>
+              </div>
+              <p v-else class="timeline-empty">Menghubungkan ke log run…</p>
+
+              <div class="timeline-workers">
+                <p class="agent-list-label">WORKERS</p>
+                <ul class="agent-list">
+                  <li
+                    v-for="agent in agentActivities"
+                    :key="agent.id"
+                    class="agent-row"
+                    :class="{ 'selected-agent': agent.isRouted }"
+                    :title="agent.description"
+                  >
+                    <span class="agent-indicator" :class="agent.status" aria-hidden="true" />
+                    <span class="agent-name">{{ agent.name }}</span>
+                    <span class="agent-state" :class="agent.status">
+                      {{ { idle: 'Idle', thinking: 'Thinking', working: 'Working', approval: 'Approval', completed: 'Done', error: 'Error' }[agent.status] }}
+                    </span>
+                  </li>
+                </ul>
+              </div>
+
+              <details v-if="currentRouteExplanation || currentPlanProgress.length" class="process-summary">
+                <summary>Ringkasan proses yang dapat diaudit</summary>
+                <p v-if="currentRouteExplanation"><strong>Alasan routing:</strong> {{ currentRouteExplanation }}</p>
+                <ol v-if="currentPlanProgress.length">
+                  <li v-for="step in currentPlanProgress" :key="step.index">
+                    <strong>{{ step.description }}</strong>
+                    <span v-if="stepSummary(step.index)">{{ stepSummary(step.index) }}</span>
+                  </li>
+                </ol>
+                <small>Ringkasan ini memakai routing dan hasil langkah yang tercatat, bukan chain-of-thought internal.</small>
+              </details>
+
+              <div v-if="isWorkflowPaused" class="run-controls">
+                <p>Run dijeda pada checkpoint aman.</p>
+                <button type="button" :disabled="isResumingRun" @click="resumeCurrentRun">
+                  {{ isResumingRun ? 'Melanjutkan…' : 'Lanjutkan run' }}
                 </button>
               </div>
-            </div>
-            <div v-else class="messages" aria-live="polite" :aria-busy="busy">
-              <article
-                v-for="message in displayMessages"
-                :key="message.id"
-                class="message"
-                :class="[message.role, { pending: message.pending }]"
-              >
-                <div class="message-avatar">{{ message.role === 'assistant' ? 'A' : 'K' }}</div>
-                <div class="message-content">
-                  <p class="message-author">{{ message.role === 'assistant' ? 'Aether' : 'Kamu' }}<span v-if="message.pending && message.role === 'assistant'" class="thinking-label">Sedang berpikir</span></p>
-                  <div v-if="message.content" class="message-markdown" v-html="renderMessageMarkdown(message.content)" />
-                  <p v-else-if="message.pending" class="thinking-placeholder"><span />Agent sedang menyiapkan respons…</p>
-                </div>
-              </article>
-            </div>
+            </section>
 
-            <div class="composer-wrap">
+            <div class="composer-wrap" :class="{ 'goal-composer-wrap': !hasStartedTask }">
               <p v-if="errorMessage" class="error-message chat-error" role="alert">{{ errorMessage }}</p>
-              <form class="composer" @submit.prevent="sendMessage">
-                <textarea ref="composerInput" v-model="draft" maxlength="12000" rows="2" aria-label="Pesan untuk Aether" :placeholder="isWorkflowActive ? 'Tulis untuk mengalihkan tujuan run...' : 'Tulis pesan untuk Aether...'" @keydown.enter.exact.prevent="sendMessage" />
+              <form class="composer task-composer" @submit.prevent="sendMessage">
+                <label class="visually-hidden" for="task-goal">Tujuan task untuk Aether</label>
+                <textarea
+                  id="task-goal"
+                  ref="composerInput"
+                  v-model="draft"
+                  maxlength="12000"
+                  rows="1"
+                  aria-label="Tujuan task untuk Aether"
+                  :placeholder="isWorkflowActive || isWorkflowPaused ? '> Tulis perubahan tujuan untuk mengalihkan run…' : '> Apa yang ingin Aether selesaikan?'"
+                  @keydown.enter.exact.prevent="sendMessage"
+                />
                 <div class="composer-footer">
-                  <span>{{ isWorkflowActive ? 'Respons mengalir · Kirim pesan untuk mengalihkan tujuan.' : 'Enter untuk mengirim · Shift + Enter untuk baris baru' }}</span>
+                  <span>{{ isWorkflowActive ? 'Run aktif · instruksi berikutnya akan mengalihkan tujuan.' : 'Satu tujuan yang jelas membantu Aether bekerja lebih terarah.' }}</span>
                   <div class="composer-actions">
                     <label class="inline-model-select">
                       <span class="visually-hidden">Pilih model · {{ modelDetails.provider }}</span>
@@ -1222,9 +1433,7 @@ onBeforeUnmount(() => {
                       :aria-pressed="speakReplies"
                       :title="speechSynthesisAvailable ? (speakReplies ? 'Matikan balasan suara' : 'Aktifkan balasan suara') : 'Balasan suara tidak didukung browser ini'"
                       @click="toggleSpokenReplies"
-                    >
-                      {{ speakReplies ? 'Suara aktif' : 'Suara mati' }}
-                    </button>
+                    >{{ speakReplies ? 'Suara aktif' : 'Suara mati' }}</button>
                     <button
                       class="voice-button"
                       :class="{ listening: isListening }"
@@ -1233,27 +1442,15 @@ onBeforeUnmount(() => {
                       :aria-label="isListening ? 'Selesai merekam suara' : 'Mulai input suara'"
                       :title="speechRecognitionAvailable ? (isListening ? 'Selesai bicara' : 'Bicara ke Aether') : 'Input suara tidak didukung browser ini'"
                       @click="startVoiceInput"
-                    >
-                      {{ isListening ? 'Selesai ■' : 'Mikrofon' }}
+                    >{{ isListening ? 'Selesai ■' : 'Mikrofon' }}</button>
+                    <button v-if="busy && isWorkflowActive" class="pause-button" type="button" :disabled="isPausingRun" @click="pauseCurrentRun">
+                      {{ isPausingRun ? 'Menjeda…' : 'Jeda' }}
                     </button>
-                    <button
-                      v-if="busy && isWorkflowActive"
-                      class="pause-button"
-                      type="button"
-                      :disabled="isPausingRun"
-                      @click="pauseCurrentRun"
-                    >{{ isPausingRun ? 'Menjeda…' : 'Jeda' }}</button>
-                    <button
-                      v-if="busy && isWorkflowActive"
-                      class="stop-button"
-                      type="button"
-                      :disabled="isStoppingRun"
-                      @click="stopCurrentRun"
-                    >
+                    <button v-if="busy && isWorkflowActive" class="stop-button" type="button" :disabled="isStoppingRun" @click="stopCurrentRun">
                       {{ isStoppingRun ? 'Menghentikan…' : 'Hentikan' }}
                     </button>
-                    <button class="send-button" type="submit" :disabled="!draft.trim() || (busy && !isWorkflowActive)">
-                      {{ isRedirectingRun ? 'Mengalihkan…' : isWorkflowActive || isWorkflowPaused ? 'Alihkan →' : busy ? 'Memproses…' : 'Kirim ↑' }}
+                    <button class="send-button" type="submit" :disabled="!draft.trim() || (busy && !isWorkflowActive)" :aria-label="hasStartedTask ? 'Jalankan instruksi' : 'Jalankan task'">
+                      {{ isRedirectingRun ? 'Mengalihkan…' : isWorkflowActive || isWorkflowPaused ? 'Alihkan tujuan' : busy ? 'Menjalankan…' : 'Jalankan ↗' }}
                     </button>
                   </div>
                 </div>
@@ -1263,136 +1460,97 @@ onBeforeUnmount(() => {
                 {{ speechRecognitionAvailable ? 'Mikrofon hanya aktif saat tombol ditekan. Pengenalan ucapan menggunakan layanan browser.' : 'Input suara tidak didukung browser ini. Coba Chrome atau Edge terbaru.' }}
               </p>
             </div>
+
+            <section v-if="!hasStartedTask" class="capabilities-panel" aria-labelledby="capabilities-title">
+              <div class="capabilities-heading">
+                <div>
+                  <p class="eyebrow">AVAILABLE CAPABILITIES</p>
+                  <h2 id="capabilities-title">Apa yang bisa Aether lakukan</h2>
+                </div>
+                <span>AKSI TERBATAS</span>
+              </div>
+              <div class="capability-grid">
+                <button v-for="capability in capabilities" :key="capability.name" type="button" class="capability-card" @click="useSuggestedPrompt(capability.prompt)">
+                  <span class="capability-icon" aria-hidden="true">{{ capability.icon }}</span>
+                  <span class="capability-copy">
+                    <strong>{{ capability.name }}</strong>
+                    <small>{{ capability.detail }}</small>
+                  </span>
+                  <span class="capability-action" aria-hidden="true">＋</span>
+                </button>
+              </div>
+            </section>
           </section>
 
-          <aside class="agent-workspace" aria-labelledby="agent-workspace-title">
-            <div class="activity-heading">
+          <aside v-if="hasStartedTask" class="artifact-pane" aria-labelledby="artifact-title">
+            <header class="task-pane-heading">
               <div>
-                <p class="eyebrow">SYSTEM / AGENTS</p>
-                <h2 id="agent-workspace-title">Execution</h2>
+                <p class="eyebrow">OUTPUT / ARTIFACTS</p>
+                <h2 id="artifact-title">Hasil task</h2>
               </div>
-              <span class="activity-status" :class="activityStatus">
-                <span class="connection-dot" aria-hidden="true" />
-                {{ activityStatus === 'connected' ? 'Live' : activityStatus === 'connecting' ? 'Linking' : activeConversationId ? 'Offline' : 'Standby' }}
+              <span class="output-state" :class="{ ready: latestAssistantOutput && !busy, running: busy }">
+                <span class="status-dot" />
+                {{ busy ? 'Updating' : latestAssistantOutput ? 'Ready' : 'Waiting' }}
               </span>
-            </div>
+            </header>
 
-            <div class="run-overview">
-              <span class="run-kicker">CURRENT RUN</span>
-              <strong>{{ currentRunStatus }}</strong>
-              <span v-if="currentRunEvents.length">RUN / {{ currentRunEvents[0].run_id.slice(0, 8) }}</span>
-              <span v-else>{{ activeConversationId ? 'Menunggu event percakapan.' : 'Belum ada run.' }}</span>
-            </div>
+            <section class="artifact-card primary-artifact">
+              <div class="artifact-card-heading">
+                <span>AGENT RESPONSE</span>
+                <span class="artifact-kind">REPORT</span>
+              </div>
+              <div v-if="latestAssistantOutput" class="task-output message-markdown" v-html="renderMessageMarkdown(latestAssistantOutput)" />
+              <p v-else-if="busy" class="artifact-placeholder"><span class="status-dot running" />Menunggu hasil pertama dari Aether…</p>
+              <p v-else class="artifact-placeholder">Hasil, ringkasan, dan jawaban akhir akan muncul di sini.</p>
+            </section>
 
-            <div v-if="currentRunEvents.length" class="usage-meter" aria-label="Penggunaan model">
+            <details v-if="conversationHistory.length" class="artifact-section conversation-history">
+              <summary>Riwayat percakapan <span>{{ conversationHistory.length }}</span></summary>
+              <article
+                v-for="message in conversationHistory"
+                :key="message.id"
+                class="history-message"
+                :class="message.role"
+              >
+                <header>
+                  <strong>{{ message.role === 'assistant' ? 'Aether' : 'Kamu' }}</strong>
+                  <time :datetime="message.created_at">{{ formatActivityTime(message.created_at) }}</time>
+                </header>
+                <div class="message-markdown" v-html="renderMessageMarkdown(message.content)" />
+              </article>
+            </details>
+
+            <section v-if="currentPlanProgress.some((step) => step.status === 'completed' && stepSummary(step.index))" class="artifact-section">
+              <div class="artifact-section-heading">
+                <h3>Catatan langkah</h3>
+                <span>{{ currentPlanProgress.filter((step) => step.status === 'completed' && stepSummary(step.index)).length }}</span>
+              </div>
+              <article v-for="step in currentPlanProgress" :key="step.index">
+                <template v-if="step.status === 'completed' && stepSummary(step.index)">
+                  <p>{{ step.description }}</p>
+                  <span>{{ stepSummary(step.index) }}</span>
+                </template>
+              </article>
+            </section>
+
+            <section v-if="currentToolEvents.some((event) => event.type === 'tool.completed' && event.data.output !== undefined)" class="artifact-section tool-artifacts">
+              <div class="artifact-section-heading">
+                <h3>Tool outputs</h3>
+                <span>{{ currentToolEvents.filter((event) => event.type === 'tool.completed' && event.data.output !== undefined).length }}</span>
+              </div>
+              <details v-for="event in currentToolEvents.filter((item) => item.type === 'tool.completed' && item.data.output !== undefined)" :key="event.event_id">
+                <summary><span class="tool-output-icon">✓</span>{{ String(event.data.tool || 'Tool') }}</summary>
+                <pre>{{ formatRunValue(event.data.output) }}</pre>
+              </details>
+            </section>
+
+            <div v-if="currentRunEvents.length" class="usage-meter artifact-usage" aria-label="Penggunaan model">
               <p class="agent-list-label">RUN USAGE</p>
               <div><span>Token</span><strong>{{ formatUsageCount(currentUsage.totalTokens ?? 0) }}</strong></div>
               <div><span>Input / output</span><strong>{{ formatUsageCount(currentUsage.promptTokens ?? 0) }} / {{ formatUsageCount(currentUsage.completionTokens ?? 0) }}</strong></div>
               <div><span>Panggilan model</span><strong>{{ formatUsageCount(currentUsage.modelCalls ?? 0) }}</strong></div>
               <div><span>Biaya dilaporkan</span><strong>{{ formatReportedCost(currentUsage.reportedCost) }}</strong></div>
               <small v-if="currentUsage.costLimit !== undefined">Batas biaya: {{ formatReportedCost(currentUsage.costLimit) }} · berdasarkan laporan provider</small>
-            </div>
-
-            <div class="orchestration-path" aria-label="Alur routing agent">
-              <div class="orchestration-node">
-                <span class="route-node-label">ORCHESTRATOR</span>
-                <div class="orchestration-identity">
-                  <span class="agent-indicator" :class="agentActivities[0]?.status" aria-hidden="true" />
-                  <strong>Aether Core</strong>
-                </div>
-                <span class="orchestration-state">{{ agentActivities[0]?.status === 'thinking' ? 'Menganalisis permintaan' : routedAgentId ? 'Routing selesai' : 'Menunggu routing' }}</span>
-              </div>
-
-              <div class="orchestration-connector" aria-hidden="true" />
-
-              <div class="orchestration-node worker-node" :class="{ 'route-node-selected': routedAgentId }">
-                <span class="route-node-label">ROUTED WORKER</span>
-                <div class="orchestration-identity">
-                  <span v-if="routedAgentId" class="agent-indicator" :class="agentActivities.find((agent) => agent.id === routedAgentId)?.status" aria-hidden="true" />
-                  <strong>{{ routedAgentId ? agentDisplayName(routedAgentId) : 'Belum dipilih' }}</strong>
-                </div>
-                <span class="orchestration-state">{{ routedAgentId ? 'Dipilih oleh Aether Core' : 'Menunggu event routing' }}</span>
-              </div>
-            </div>
-
-            <div v-if="currentPlanProgress.length" class="plan-progress" aria-label="Rencana eksekusi">
-              <p class="agent-list-label">EXECUTION PLAN</p>
-              <ol>
-                <li v-for="step in currentPlanProgress" :key="step.index" :class="step.status">
-                  <span class="plan-step-index">{{ String(step.index).padStart(2, '0') }}</span>
-                  <span class="plan-step-description">{{ step.description }}</span>
-                  <span class="plan-step-status">
-                    {{ step.status === 'completed' ? 'Selesai' : step.status === 'in_progress' ? 'Berjalan' : step.status === 'stopped' ? 'Terhenti' : step.status === 'paused' ? 'Dijeda' : 'Menunggu' }}
-                  </span>
-                </li>
-              </ol>
-            </div>
-
-            <details v-if="currentRouteExplanation || currentPlanProgress.length" class="process-summary">
-              <summary>Ringkasan proses</summary>
-              <p v-if="currentRouteExplanation"><strong>Alasan routing:</strong> {{ currentRouteExplanation }}</p>
-              <ol v-if="currentPlanProgress.length">
-                <li v-for="step in currentPlanProgress" :key="step.index">
-                  <strong>{{ step.description }}</strong>
-                  <span v-if="stepSummary(step.index)">{{ stepSummary(step.index) }}</span>
-                </li>
-              </ol>
-              <small>Ringkasan ini berdasarkan routing dan hasil langkah yang tercatat, bukan chain-of-thought internal.</small>
-            </details>
-
-            <div v-if="currentToolEvents.length" class="tool-event-details">
-              <p class="agent-list-label">TOOL DETAILS</p>
-              <details v-for="event in currentToolEvents" :key="event.event_id">
-                <summary>
-                  {{ String(event.data.tool || 'Tool') }} ·
-                  {{ event.type === 'tool.started' ? 'Dimulai' : event.type === 'tool.completed' ? 'Selesai' : 'Gagal' }}
-                </summary>
-                <template v-if="event.data.input !== undefined">
-                  <span>Input</span><pre>{{ formatRunValue(event.data.input) }}</pre>
-                </template>
-                <template v-if="event.data.output !== undefined">
-                  <span>Output</span><pre>{{ formatRunValue(event.data.output) }}</pre>
-                </template>
-                <p v-if="event.data.error" class="tool-error">{{ String(event.data.error) }}</p>
-              </details>
-            </div>
-
-            <div v-if="isWorkflowPaused" class="run-controls">
-              <p>Run berhenti sementara di checkpoint aman. Tidak ada langkah baru yang berjalan.</p>
-              <button type="button" :disabled="isResumingRun" @click="resumeCurrentRun">
-                {{ isResumingRun ? 'Melanjutkan…' : 'Lanjutkan run' }}
-              </button>
-            </div>
-
-            <div class="agent-directory">
-              <p class="agent-list-label">AVAILABLE WORKERS</p>
-              <ul class="agent-list">
-                <li
-                  v-for="agent in agentActivities.filter((item) => item.id !== 'aether_core')"
-                  :key="agent.id"
-                  class="agent-row"
-                  :class="{ 'selected-agent': agent.isRouted }"
-                  :aria-current="agent.isRouted ? 'step' : undefined"
-                  :title="agent.description"
-                >
-                  <span class="agent-indicator" :class="agent.status" aria-hidden="true" />
-                  <span class="agent-name">{{ agent.name }}</span>
-                  <span class="agent-state" :class="agent.status">
-                    {{ { idle: 'Idle', thinking: 'Thinking', working: 'Working', approval: 'Approval', completed: 'Done', error: 'Error' }[agent.status] }}
-                  </span>
-                </li>
-              </ul>
-            </div>
-
-            <div v-if="latestActivity.length" class="event-trail" aria-label="Aktivitas terkini">
-              <p class="agent-list-label">EVENT LOG</p>
-              <ol>
-                <li v-for="event in latestActivity" :key="event.event_id">
-                  <time :datetime="event.created_at">{{ formatActivityTime(event.created_at) }}</time>
-                  <span class="event-actor">{{ activityActor(event) }}</span>
-                  <span>{{ activityDescription(event) }}</span>
-                </li>
-              </ol>
             </div>
           </aside>
         </div>
@@ -1501,6 +1659,29 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </section>
+
+      <div v-if="currentApprovalModal" class="approval-overlay" role="presentation" @click.self="dismissApprovalModal">
+        <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-dialog-title">
+          <button class="approval-close" type="button" aria-label="Tutup detail persetujuan" @click="dismissApprovalModal">×</button>
+          <p class="eyebrow approval-eyebrow">ACTION NEEDS APPROVAL</p>
+          <h2 id="approval-dialog-title">Aether meminta persetujuan</h2>
+          <p class="approval-description">
+            {{ currentApprovalModal.tool_name === 'create_task' ? 'Aether ingin membuat tugas berikut. Tugas belum dibuat sampai kamu menyetujuinya.' : 'Tinjau detail tindakan ini sebelum memutuskan.' }}
+          </p>
+          <div class="approval-action-name">
+            <span>TOOL</span>
+            <strong>{{ currentApprovalModal.tool_name }}</strong>
+          </div>
+          <pre class="approval-arguments">{{ formatRunValue(currentApprovalModal.tool_arguments) }}</pre>
+          <div class="approval-dialog-actions">
+            <button type="button" class="approval-deny" :disabled="busy" @click="decideApproval(currentApprovalModal, false)">Tolak</button>
+            <button type="button" class="approval-allow" :disabled="busy" @click="decideApproval(currentApprovalModal, true)">
+              {{ busy ? 'Memproses…' : 'Setujui tindakan' }}
+            </button>
+          </div>
+        </section>
+      </div>
+      </div>
     </section>
   </main>
 </template>
@@ -2071,5 +2252,617 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+}
+
+.app-shell { background: #0b0c0f; }
+.topbar { background: #0b0c0f; border-bottom-color: #292a2e; }
+.workspace { grid-template-columns: 252px minmax(0, 1fr); background: #0b0c0f; }
+.sidebar { border-right: 1px solid #292a2e; background: #0d0e11; }
+.new-chat { border: 1px solid #33353b; background: #111216; }
+.new-chat:hover { border-color: #55575e; background: #15161a; }
+.new-chat span, .workspace-nav button > span:first-child { color: #aeb3bb; }
+.workspace-nav button:hover, .workspace-nav button.selected { background: #17181c; }
+.sidebar-heading { color: #747982; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.conversation-search input { border-color: #2b2c31; background: #101115; }
+.conversation-item.selected, .conversation-item:hover { background: #17181c; }
+.chat-area { min-height: 0; padding: 0 24px 12px; background: #0b0c0f; }
+.chat-heading { min-height: 64px; flex: 0 0 auto; border-bottom-color: #292a2e; }
+.chat-heading .eyebrow, .task-pane-heading .eyebrow, .capabilities-heading .eyebrow {
+  color: #747982;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+}
+.chat-heading h1 { font-size: 17px; font-weight: 550; letter-spacing: -0.02em; }
+.task-workspace { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(300px, 0.92fr); }
+.task-workspace.is-empty { grid-template-columns: minmax(0, 1fr); }
+.task-main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.task-workspace.is-empty .task-main { display: grid; grid-template-rows: minmax(0, 1fr) auto auto minmax(0, 0.45fr); }
+.task-landing-intro { width: min(760px, 100%); align-self: end; justify-self: center; padding: 0 8px 18px; }
+.task-landing-intro .eyebrow { margin: 0 0 12px; color: #747982; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; letter-spacing: 0.12em; }
+.task-landing-intro h2 { margin: 0; color: #edf0f3; font-size: clamp(26px, 3.2vw, 38px); font-weight: 520; line-height: 1.16; letter-spacing: -0.045em; }
+.task-landing-intro h2 span { color: #aeb3bb; }
+.task-landing-intro > p:last-child { max-width: 610px; margin: 12px 0 0; color: #888d96; font-size: 12px; line-height: 1.7; }
+.task-timeline-pane { min-height: 0; flex: 1; overflow-y: auto; padding: 20px 22px 18px 4px; scrollbar-color: #33353b transparent; }
+.task-pane-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-bottom: 15px; border-bottom: 1px solid #292a2e; }
+.task-pane-heading .eyebrow { margin: 0 0 5px; }
+.task-pane-heading h2 { margin: 0; color: #e8ebef; font-size: 15px; font-weight: 560; letter-spacing: -0.025em; }
+.run-state, .output-state { display: inline-flex; align-items: center; gap: 7px; color: #878c95; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; white-space: nowrap; }
+.run-state.running, .output-state.running, .output-state.ready { color: #80cfae; }
+.run-state.success { color: #80cfae; }
+.run-state.approval { color: #d7b86f; }
+.run-state.error { color: #d97b7e; }
+.status-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: currentColor; }
+.run-summary { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 15px 0; border-bottom: 1px solid #25262a; }
+.run-summary-copy { min-width: 0; display: grid; gap: 6px; }
+.run-kicker, .run-usage-inline, .artifact-card-heading, .artifact-kind, .capabilities-heading > span, .approval-action-name > span {
+  color: #747982;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+}
+.run-summary-copy strong { overflow: hidden; color: #d8dce1; font-size: 11px; font-weight: 500; text-overflow: ellipsis; }
+.run-usage-inline { display: flex; flex: 0 0 auto; gap: 10px; letter-spacing: 0; }
+.tool-activity { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding: 9px 10px; border: 1px solid #292a2e; color: #9297a0; font-size: 9px; }
+.tool-activity > span:first-child { color: #aaaeb5; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.tool-activity strong { color: #c9cdd2; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; font-weight: 500; }
+.tool-activity > span:last-child { margin-left: auto; color: #7e838c; }
+.tool-activity.running { border-color: #375142; }
+.tool-activity.running > span:first-child, .tool-activity.running strong { color: #80cfae; }
+.tool-activity.failed { border-color: #583638; }
+.tool-activity.failed > span:first-child, .tool-activity.failed strong { color: #d97b7e; }
+.plan-progress { margin-top: 18px; padding-top: 0; border: 0; }
+.plan-progress .agent-list-label, .task-event-log > .agent-list-label, .timeline-workers > .agent-list-label { margin: 0 0 9px; }
+.plan-progress ol { gap: 0; margin-top: 0; border-top: 1px solid #25262a; }
+.plan-progress li { grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 38px; padding: 7px 0; border-bottom: 1px solid #25262a; color: #9da2aa; font-size: 10px; }
+.plan-step-index { color: #777c85; font-size: 9px; }
+.plan-progress li.completed .plan-step-index, .plan-progress li.completed .plan-step-status { color: #80cfae; }
+.plan-progress li.in_progress .plan-step-status, .plan-progress li.paused .plan-step-status { color: #d7b86f; }
+.plan-progress li.stopped .plan-step-status { color: #d97b7e; }
+.task-event-log { margin-top: 19px; }
+.task-event-log ol { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.task-event-log li { min-width: 0; display: grid; grid-template-columns: 16px 40px minmax(0, 1fr); align-items: start; gap: 8px; padding: 9px 0; border-bottom: 1px solid #222328; color: #989da5; }
+.timeline-marker { width: 14px; height: 14px; display: grid; place-items: center; border: 1px solid #393b41; border-radius: 50%; color: #777c85; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 8px; line-height: 1; }
+.task-event-log li.success .timeline-marker { border-color: #375142; color: #80cfae; }
+.task-event-log li.running .timeline-marker { border-color: #375142; color: #80cfae; }
+.task-event-log li.approval .timeline-marker { border-color: #594d30; color: #d7b86f; }
+.task-event-log li.error .timeline-marker { border-color: #583638; color: #d97b7e; }
+.task-event-log time { padding-top: 2px; color: #717680; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 8px; }
+.timeline-entry { min-width: 0; display: grid; gap: 3px; }
+.timeline-entry strong { color: #c4c8ce; font-size: 10px; font-weight: 500; line-height: 1.45; }
+.timeline-entry > span { color: #737882; font-size: 8px; }
+.timeline-empty { color: #777c85; font-size: 10px; }
+.timeline-workers { margin-top: 17px; padding-top: 14px; border-top: 1px solid #292a2e; }
+.timeline-workers .agent-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 2px 12px; margin: 0; }
+.timeline-workers .agent-row { min-height: 30px; grid-template-columns: 7px minmax(0, 1fr) auto; padding: 6px 2px; border: 0; border-bottom: 1px solid #222328; background: transparent; }
+.timeline-workers .agent-name { color: #b7bcc4; font-size: 9px; }
+.timeline-workers .agent-state { font-size: 8px; }
+.agent-indicator.working, .agent-state.working, .agent-indicator.completed, .agent-state.completed { background-color: #80cfae; color: #80cfae; }
+.agent-indicator.thinking, .agent-state.thinking, .agent-indicator.approval, .agent-state.approval { background-color: #d7b86f; color: #d7b86f; }
+.agent-indicator.error, .agent-state.error { background-color: #d97b7e; color: #d97b7e; }
+.process-summary { margin-top: 15px; padding-top: 11px; border-top: 1px solid #292a2e; color: #858a93; font-size: 9px; }
+.process-summary summary { color: #b9bec5; font-size: 9px; }
+.process-summary li strong { color: #b9bec5; }
+.process-summary li span { color: #818690; }
+.composer-wrap { position: sticky; z-index: 2; bottom: 0; width: auto; max-width: none; margin: 0; padding: 12px 22px 7px 4px; background: linear-gradient(180deg, #0b0c0f00 0%, #0b0c0f 18%); }
+.task-composer { padding: 9px 10px 8px; border-color: #303238; border-radius: 7px; background: #101115; }
+.task-composer:focus-within { border-color: #777b83; }
+.task-composer textarea { min-height: 42px; max-height: 140px; resize: vertical; font-size: 12px; }
+.task-composer textarea::placeholder { color: #747982; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+.composer-footer { min-height: 29px; color: #747982; font-size: 8px; }
+.composer-actions { flex-wrap: wrap; justify-content: flex-end; gap: 5px; }
+.inline-model-select select, .voice-toggle, .voice-button { max-width: 152px; padding: 6px 7px; border: 1px solid #303238; border-radius: 4px; background: #111216; color: #aeb3bb; font-size: 8px; }
+.voice-toggle[aria-pressed="true"] { border-color: #3a4b41; color: #aeb3bb; }
+.voice-button.listening { border-color: #594d30; background: #171510; color: #d7b86f; }
+.send-button { padding: 7px 10px; border: 1px solid #d5d7db; border-radius: 4px; background: #d5d7db; color: #111216; font-size: 9px; }
+.send-button:hover:not(:disabled) { background: #f0f1f2; }
+.pause-button { padding: 7px 9px; border: 1px solid #594d30; border-radius: 4px; background: #171510; color: #d7b86f; font-size: 8px; }
+.stop-button { padding: 7px 9px; border: 1px solid #583638; border-radius: 4px; background: #171113; color: #d97b7e; font-size: 8px; }
+.voice-privacy { text-align: left; }
+.goal-composer-wrap { position: static; grid-row: 2; width: min(760px, 100%); justify-self: center; padding: 0 8px; background: transparent; }
+.goal-composer { padding: 13px 14px 10px; border-color: #383a40; }
+.goal-composer textarea { min-height: 52px; font-size: 14px; }
+.goal-composer .composer-footer > span { color: #777c85; }
+.capabilities-panel { grid-row: 3; width: min(760px, 100%); justify-self: center; align-self: start; padding: 22px 8px 0; }
+.capabilities-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.capabilities-heading .eyebrow { margin: 0 0 5px; }
+.capabilities-heading h2 { margin: 0; color: #d9dde2; font-size: 12px; font-weight: 550; }
+.capabilities-heading > span { font-size: 7px; }
+.capability-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid #292a2e; }
+.capability-card { min-width: 0; display: grid; grid-template-columns: 26px minmax(0, 1fr) 12px; align-items: center; gap: 9px; padding: 12px 7px; border: 0; border-bottom: 1px solid #292a2e; background: transparent; color: #c5c9cf; text-align: left; }
+.capability-card:nth-child(odd) { border-right: 1px solid #292a2e; }
+.capability-card:hover { background: #101115; }
+.capability-icon { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid #34363c; border-radius: 4px; color: #b7bbc2; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
+.capability-copy { min-width: 0; display: grid; gap: 4px; }
+.capability-copy strong { color: #d3d6db; font-size: 9px; font-weight: 550; }
+.capability-copy small { color: #7f848d; font-size: 8px; line-height: 1.45; }
+.capability-action { color: #777c85; font-size: 12px; }
+.artifact-pane { min-width: 0; min-height: 0; overflow-y: auto; padding: 20px 4px 20px 20px; border-left: 1px solid #292a2e; scrollbar-color: #33353b transparent; }
+.artifact-pane .task-pane-heading { padding-bottom: 15px; }
+.artifact-card { margin-top: 16px; padding: 13px; border: 1px solid #292a2e; background: #0e0f12; }
+.artifact-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid #25262a; }
+.artifact-kind { color: #777c85; font-size: 7px; }
+.task-output { padding-top: 12px; color: #cbd0d7; font-size: 11px; line-height: 1.7; }
+.task-output pre, .artifact-section pre { max-width: 100%; overflow: auto; border-color: #292a2e; border-radius: 3px; background: #090a0d; color: #c4cad2; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.task-output code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.artifact-placeholder { display: flex; align-items: center; gap: 8px; min-height: 58px; margin: 0; padding-top: 12px; color: #7d828b; font-size: 10px; line-height: 1.5; }
+.artifact-placeholder .status-dot.running { color: #80cfae; }
+.artifact-section { margin-top: 18px; }
+.artifact-section-heading { display: flex; align-items: center; justify-content: space-between; padding-bottom: 8px; border-bottom: 1px solid #292a2e; }
+.artifact-section-heading h3 { margin: 0; color: #c5c9cf; font-size: 10px; font-weight: 550; }
+.artifact-section-heading > span { color: #777c85; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 8px; }
+.artifact-section article { padding: 10px 0; border-bottom: 1px solid #222328; }
+.artifact-section article p { margin: 0 0 5px; color: #bfc4cb; font-size: 9px; }
+.artifact-section article > span { display: block; color: #818690; font-size: 9px; line-height: 1.55; overflow-wrap: anywhere; }
+.tool-artifacts details { padding: 9px 0; border-bottom: 1px solid #222328; }
+.tool-artifacts summary { color: #bec3ca; cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.tool-output-icon { margin-right: 8px; color: #80cfae; }
+.tool-artifacts pre { max-height: 220px; margin: 9px 0 0; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.artifact-usage { margin-top: 18px; }
+.approval-heading { margin-top: 20px; padding: 9px 8px; border: 1px solid #292a2e; }
+.approval-heading .sidebar-heading { margin: 0; }
+.approval-count { color: #777c85; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; }
+.approval-heading.has-approvals { border-color: #594d30; background: #14120d; }
+.approval-heading.has-approvals .sidebar-heading, .approval-heading.has-approvals .approval-count { color: #d7b86f; }
+.approval-card { border-color: #594d30; background: #14120d; }
+.approval-card p { color: #e0c782; }
+.approval-actions button:first-child { border-color: #594d30; color: #d7b86f; background: #19160e; }
+.approval-empty { margin-top: 9px; }
+.approval-overlay { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 18px; background: #000a; backdrop-filter: blur(5px); }
+.approval-dialog { position: relative; width: min(480px, 100%); padding: 26px; border: 1px solid #51472e; background: #101115; box-shadow: 0 24px 90px #0009; }
+.approval-close { position: absolute; top: 13px; right: 13px; width: 28px; height: 28px; border: 1px solid #303238; background: transparent; color: #aeb3bb; font-size: 17px; }
+.approval-eyebrow { margin: 0 0 12px; color: #d7b86f; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 8px; letter-spacing: 0.12em; }
+.approval-dialog h2 { margin: 0; color: #e5e8ec; font-size: 20px; font-weight: 550; }
+.approval-description { margin: 10px 0 18px; color: #969ba4; font-size: 11px; line-height: 1.6; }
+.approval-action-name { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid #292a2e; border-bottom: 1px solid #292a2e; }
+.approval-action-name strong { color: #d7b86f; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; font-weight: 500; }
+.approval-arguments { max-height: 180px; overflow: auto; margin: 12px 0; padding: 11px; border: 1px solid #292a2e; background: #0b0c0f; color: #c1c6cd; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.approval-dialog-actions button { padding: 9px 12px; border: 1px solid #393b41; background: transparent; color: #c5c9cf; font-size: 10px; }
+.approval-dialog-actions .approval-allow { border-color: #d7b86f; background: #d7b86f; color: #17140c; font-weight: 600; }
+.approval-dialog-actions .approval-deny:hover:not(:disabled) { border-color: #d97b7e; color: #d97b7e; }
+.brand { width: auto; height: 32px; gap: 9px; }
+.brand-mark { position: relative; width: 25px; height: 25px; display: grid; place-items: center; }
+.brand-mark img { display: block; width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 0 4px #54e4b422); transition: filter 180ms ease; }
+.brand-mark.executing img { filter: drop-shadow(0 0 7px #54e4b466); }
+.brand-mark.approval img { filter: sepia(1) saturate(1.2) brightness(1.1); }
+.brand-mark.error img { filter: sepia(0.8) saturate(2) hue-rotate(300deg); }
+.brand-mark.thinking img { animation: aether-thinking-pulse 1.8s ease-in-out infinite; }
+.brand-approval-dot { position: absolute; top: -1px; right: -2px; width: 7px; height: 7px; border: 1px solid #0b0c0f; border-radius: 50%; background: #d7b86f; box-shadow: 0 0 7px #d7b86f88; }
+.brand-name { color: #e5e8ec; font-size: 13px; font-weight: 650; letter-spacing: -0.035em; }
+.task-pane-heading h2 { display: flex; align-items: center; gap: 8px; }
+.timeline-brain { width: 15px; height: 15px; display: inline-flex; flex: 0 0 15px; }
+.timeline-brain img { width: 100%; height: 100%; object-fit: contain; filter: grayscale(1) brightness(1.3) opacity(0.68); }
+.timeline-brain.executing img { filter: drop-shadow(0 0 5px #54e4b466); }
+.timeline-brain.approval img { filter: sepia(1) saturate(1.2) brightness(1.1); }
+.timeline-brain.error img { filter: sepia(0.8) saturate(2) hue-rotate(300deg); }
+.timeline-brain.thinking img { animation: aether-thinking-pulse 1.8s ease-in-out infinite; }
+@keyframes aether-thinking-pulse {
+  0%, 100% { opacity: 0.62; transform: scale(0.94); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+
+@media (max-width: 900px) {
+  .workspace { grid-template-columns: 210px minmax(0, 1fr); }
+  .task-workspace { grid-template-columns: minmax(0, 1fr) minmax(270px, 0.85fr); }
+  .artifact-pane { padding-left: 15px; }
+  .task-timeline-pane, .composer-wrap { padding-right: 15px; }
+}
+
+@media (max-width: 1120px) {
+  .composer-footer { align-items: flex-start; flex-direction: column; gap: 7px; }
+  .composer-footer > span { max-width: 100%; }
+  .composer-actions { max-width: 100%; width: 100%; justify-content: flex-start; }
+}
+
+@media (max-width: 760px) {
+  .workspace { min-height: calc(100vh - 56px); grid-template-columns: 1fr; }
+  .sidebar { max-height: 38vh; padding: 10px 12px; }
+  .chat-area { height: auto; min-height: calc(100vh - 56px); padding: 0 16px 16px; }
+  .chat-heading { min-height: 58px; }
+  .task-workspace { min-height: 0; grid-template-columns: minmax(0, 1fr); }
+  .task-workspace.is-empty .task-main { min-height: calc(100vh - 190px); grid-template-rows: minmax(24px, 1fr) auto auto minmax(12px, 0.35fr); }
+  .task-landing-intro { padding-bottom: 14px; }
+  .task-timeline-pane { min-height: 420px; padding: 15px 0; }
+  .composer-wrap { position: sticky; padding: 10px 0 8px; }
+  .goal-composer-wrap { position: static; padding: 0 4px; }
+  .capabilities-panel { padding: 18px 4px 15px; }
+  .artifact-pane { min-height: 300px; max-height: none; overflow: visible; padding: 16px 0 8px; border-top: 1px solid #292a2e; border-left: 0; }
+  .composer-footer { align-items: flex-end; }
+  .composer-footer > span { max-width: 30%; line-height: 1.4; }
+  .composer-actions { max-width: 70%; }
+}
+
+@media (max-width: 420px) {
+  .chat-area { padding-right: 12px; padding-left: 12px; }
+  .task-landing-intro h2 { font-size: 27px; }
+  .capability-grid { grid-template-columns: 1fr; }
+  .capability-card:nth-child(odd) { border-right: 0; }
+  .task-event-log li { grid-template-columns: 16px 35px minmax(0, 1fr); gap: 6px; }
+  .composer-footer > span { display: none; }
+  .composer-actions { max-width: 100%; width: 100%; justify-content: space-between; }
+  .inline-model-select select { max-width: 120px; }
+  .approval-dialog { padding: 22px 17px; }
+}
+
+:root {
+  color-scheme: light;
+  --shell-paper: #f2f2ec;
+  --shell-card: #fbfbf7;
+  --shell-ink: #20231f;
+  --shell-muted: #777e78;
+  --shell-line: #d9dbd3;
+  --shell-sidebar: #171a18;
+  --shell-mint: #54e2b3;
+  background: var(--shell-paper);
+  color: var(--shell-ink);
+}
+body { background: var(--shell-paper); color: var(--shell-ink); }
+.app-shell { min-height: 100vh; background: var(--shell-paper); color: var(--shell-ink); }
+.standalone-topbar {
+  height: 72px;
+  padding: 0 clamp(20px, 4vw, 56px);
+  border-bottom: 1px solid var(--shell-line);
+  background: var(--shell-paper);
+}
+.standalone-topbar .brand-name { color: var(--shell-ink); }
+.topbar-right { gap: 14px; color: var(--shell-muted); }
+.backend-indicator.connected .indicator-dot { background: #35bd8e; }
+.backend-indicator.checking .indicator-dot { background: #d4aa4f; }
+.backend-indicator.unavailable .indicator-dot { background: #d56666; }
+.backend-error { color: #b94d4d; }
+.user-label { color: var(--shell-ink); }
+.sign-out { border-color: var(--shell-line); border-radius: 9px; background: var(--shell-card); color: var(--shell-ink); }
+.startup-state { min-height: calc(100vh - 72px); color: var(--shell-muted); }
+.startup-state .error-message, .error-message { color: #b94d4d; }
+
+.workspace {
+  width: 100%;
+  height: 100vh;
+  min-height: 620px;
+  grid-template-columns: 280px minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--shell-paper);
+}
+.sidebar {
+  position: relative;
+  height: 100vh;
+  max-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow-y: auto;
+  padding: 24px 14px 18px;
+  border: 0;
+  background: var(--shell-sidebar);
+  scrollbar-color: #3a403c transparent;
+}
+.sidebar-brand { width: fit-content; height: 34px; margin: 0 12px 30px; gap: 9px; }
+.sidebar-brand .brand-mark { width: 26px; height: 26px; }
+.sidebar-brand .brand-name { color: #f3f5f0; font-size: 16px; }
+.brand-mark img { filter: drop-shadow(0 0 4px #54e4b422); }
+.brand-mark.executing img { filter: drop-shadow(0 0 8px #54e4b488); }
+.new-chat {
+  min-height: 54px;
+  padding: 12px 15px;
+  border: 0;
+  border-radius: 13px;
+  background: var(--shell-mint);
+  color: #14251e;
+  font-size: 13px;
+  font-weight: 600;
+}
+.new-chat:hover { border-color: transparent; background: #68e9be; }
+.new-chat span { color: #173a2d; }
+.workspace-nav { gap: 5px; margin: 22px 0 22px; padding-bottom: 20px; border-bottom-color: #ffffff16; }
+.workspace-nav button { min-height: 45px; padding: 10px 12px; border-radius: 11px; color: #9da69f; font-size: 13px; }
+.workspace-nav button:hover, .workspace-nav button.selected { background: #292d2a; color: #f5f6f2; }
+.workspace-nav button > span:first-child { width: 19px; color: #a7b0a9; font-size: 16px; }
+.nav-count { color: #75e6bd; }
+.sidebar-heading { margin: 14px 14px 10px; color: #7f8981; font-size: 9px; letter-spacing: 0.15em; }
+.conversation-search { margin: 0 0 9px; }
+.conversation-search input {
+  padding: 10px 11px;
+  border-color: #333834;
+  border-radius: 9px;
+  background: #202421;
+  color: #e6e9e4;
+  font-size: 11px;
+}
+.conversation-search input::placeholder { color: #828b84; }
+.conversation-search input:focus { border-color: #70d8b2; }
+.conversation-item { min-height: 42px; margin: 2px 0; padding: 10px 11px; border-radius: 8px; color: #aab2ac; font-size: 11px; }
+.conversation-item.selected, .conversation-item:hover { background: #242925; color: #f1f3ef; }
+.conversation-icon { color: #89968d; }
+.empty-history, .sidebar-empty { color: #838d85; }
+.sidebar-section-heading.approval-heading { margin-top: 20px; padding: 10px 12px; border-color: #3b413c; }
+.approval-heading .sidebar-heading { color: #9ba49d; }
+.approval-count { color: #a9b0aa; }
+.approval-heading.has-approvals { border-color: #a7823b; background: #292317; }
+.approval-heading.has-approvals .sidebar-heading, .approval-heading.has-approvals .approval-count { color: #f0c66f; }
+.sidebar-card { border-color: #3b413c; border-radius: 9px; background: #202421; }
+.sidebar-card p { color: #f0c66f; }
+.sidebar-card > span { color: #a8b0aa; }
+.approval-actions button { border-color: #454c46; border-radius: 7px; background: #292e2a; color: #d6ddd6; }
+.approval-actions button:first-child { border-color: #92733b; background: #302819; color: #f0c66f; }
+
+.workspace-main {
+  min-width: 0;
+  height: calc(100vh - 6px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  margin: 6px 6px 0 0;
+  border-radius: 24px 24px 0 0;
+  background: var(--shell-paper);
+}
+.workspace-topbar {
+  z-index: 4;
+  height: 82px;
+  flex: 0 0 82px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 0 clamp(22px, 3.2vw, 48px);
+  border-bottom: 1px solid #dedfd8;
+  border-radius: 24px 24px 0 0;
+  background: #f6f6f0;
+}
+.workspace-context { min-width: 0; display: flex; align-items: center; gap: 10px; color: #737973; font-size: 14px; }
+.workspace-context strong { overflow: hidden; color: #30342f; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.context-divider { color: #b5b9b2; }
+.workspace-topbar .topbar-right { justify-content: flex-end; flex-wrap: wrap; font-size: 11px; }
+.workspace-topbar .backend-indicator { color: #6e766f; }
+.workspace-topbar .user-label { color: #4a514b; }
+.workspace-topbar .sign-out { padding: 7px 10px; }
+
+.chat-area { height: auto; min-height: 0; flex: 1; overflow: hidden; padding: 0 clamp(20px, 3.2vw, 48px) 20px; background: var(--shell-paper); }
+.task-workspace { grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr); }
+.task-main { color: var(--shell-ink); }
+.task-workspace.is-empty .task-main { grid-template-rows: minmax(0, 1fr) auto auto minmax(0, 0.35fr); }
+.task-landing-intro { width: min(940px, 100%); align-self: end; padding: 0 16px 27px; text-align: center; }
+.task-landing-intro .eyebrow { margin-bottom: 18px; color: #479f82; font-family: inherit; font-size: 11px; letter-spacing: 0.18em; }
+.task-landing-intro h2 {
+  margin: 0;
+  color: #1d211e;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(42px, 5.2vw, 72px);
+  font-weight: 700;
+  line-height: 1.02;
+  letter-spacing: -0.055em;
+}
+.task-landing-intro h2 span { color: #1d211e; }
+.task-landing-intro > p:last-child { max-width: 620px; margin: 22px auto 0; color: #7c827d; font-size: 14px; line-height: 1.65; }
+.task-timeline-pane { padding: 25px 24px 20px 2px; scrollbar-color: #c4c7bf transparent; }
+.task-pane-heading { border-bottom-color: var(--shell-line); }
+.task-pane-heading .eyebrow { color: #668879; font-family: inherit; }
+.task-pane-heading h2 { color: #262a26; }
+.run-state, .output-state { color: #777e78; }
+.run-state.running, .run-state.success, .output-state.running, .output-state.ready { color: #328d6d; }
+.run-state.approval { color: #a27725; }
+.run-state.error { color: #b94d4d; }
+.run-summary { border-bottom-color: var(--shell-line); }
+.run-kicker, .run-usage-inline, .artifact-card-heading, .artifact-kind, .capabilities-heading > span { color: #777e78; }
+.run-summary-copy strong { color: #343934; }
+.tool-activity { border-color: #d7dad2; color: #737a73; background: #f8f8f3; }
+.tool-activity > span:first-child, .tool-activity strong { color: #555d56; }
+.tool-activity > span:last-child { color: #7c837d; }
+.tool-activity.running { border-color: #a9d8c5; background: #f0faf5; }
+.tool-activity.running > span:first-child, .tool-activity.running strong { color: #278361; }
+.tool-activity.failed { border-color: #e2bcbc; background: #fff6f5; }
+.tool-activity.failed > span:first-child, .tool-activity.failed strong { color: #b94d4d; }
+.agent-list-label { color: #7c827d; font-family: inherit; letter-spacing: 0.12em; }
+.plan-progress ol { border-top-color: var(--shell-line); }
+.plan-progress li { border-bottom-color: var(--shell-line); color: #646b65; }
+.plan-step-index { color: #858b85; }
+.plan-progress li.completed .plan-step-index, .plan-progress li.completed .plan-step-status { color: #328d6d; }
+.plan-progress li.in_progress .plan-step-status, .plan-progress li.paused .plan-step-status { color: #a27725; }
+.plan-progress li.stopped .plan-step-status { color: #b94d4d; }
+.task-event-log li { border-bottom-color: #e0e1db; color: #5e655f; }
+.timeline-marker { border-color: #c7cbc3; color: #858b85; }
+.task-event-log li.success .timeline-marker, .task-event-log li.running .timeline-marker { border-color: #8bc4aa; color: #328d6d; }
+.task-event-log li.approval .timeline-marker { border-color: #d7bd81; color: #a27725; }
+.task-event-log li.error .timeline-marker { border-color: #d8a2a2; color: #b94d4d; }
+.task-event-log time, .timeline-entry > span { color: #848a84; }
+.timeline-entry strong { color: #393e39; }
+.timeline-empty { color: #747b75; }
+.timeline-workers { border-top-color: var(--shell-line); }
+.timeline-workers .agent-row { border-bottom-color: #e0e1db; }
+.timeline-workers .agent-name { color: #464d47; }
+.timeline-workers .agent-state { color: #777e78; }
+.agent-indicator.working, .agent-state.working, .agent-indicator.completed, .agent-state.completed { background-color: #328d6d; color: #328d6d; }
+.agent-indicator.thinking, .agent-state.thinking, .agent-indicator.approval, .agent-state.approval { background-color: #a27725; color: #a27725; }
+.agent-indicator.error, .agent-state.error { background-color: #b94d4d; color: #b94d4d; }
+.process-summary { border-top-color: var(--shell-line); color: #666d67; }
+.process-summary summary, .process-summary li strong { color: #434a44; }
+.process-summary li span { color: #727972; }
+.process-summary small, .usage-meter small { color: #818781; }
+.composer-wrap { background: linear-gradient(180deg, #f2f2ec00 0%, #f2f2ec 18%); }
+.task-composer { border-color: #d7dad2; border-radius: 11px; background: #fbfbf7; box-shadow: 0 8px 26px #30352d0b; }
+.task-composer:focus-within { border-color: #77c9a9; }
+.task-composer textarea { color: #303630; }
+.task-composer textarea::placeholder { color: #888f88; }
+.composer-footer { color: #868c86; }
+.inline-model-select select, .voice-toggle, .voice-button { border-color: #d8dbd4; background: #f7f7f2; color: #555d56; }
+.voice-toggle[aria-pressed="true"] { border-color: #a8d7c3; color: #338567; }
+.voice-button.listening { border-color: #d6bd80; background: #fcf8ed; color: #a27725; }
+.send-button { border-color: var(--shell-mint); border-radius: 7px; background: var(--shell-mint); color: #17372b; }
+.send-button:hover:not(:disabled) { background: #74ebc2; }
+.pause-button { border-color: #d6bd80; background: #fcf8ed; color: #916c24; }
+.stop-button { border-color: #d8a2a2; background: #fff6f5; color: #b94d4d; }
+.voice-privacy, .voice-status { color: #858b85; }
+.capabilities-panel { width: min(1080px, 100%); padding: 24px 8px 0; }
+.capabilities-heading { justify-content: center; margin-bottom: 13px; }
+.capabilities-heading .eyebrow { display: none; }
+.capabilities-heading h2 { color: #777e78; font-size: 11px; font-weight: 500; }
+.capabilities-heading > span { display: none; }
+.capability-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; border-top: 0; }
+.capability-card {
+  min-height: 88px;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid #dedfd8;
+  border-radius: 17px;
+  background: #f8f8f4;
+}
+.capability-card:nth-child(odd) { border-right: 1px solid #dedfd8; }
+.capability-card:hover { border-color: #b8cfc2; background: #fbfbf7; }
+.capability-icon { width: 32px; height: 32px; border: 0; border-radius: 10px; background: #def5eb; color: #368b6e; font-size: 13px; }
+.capability-copy { gap: 5px; }
+.capability-copy strong { color: #343a35; font-size: 10px; }
+.capability-copy small { color: #828982; font-size: 9px; }
+.capability-action { display: none; }
+
+.artifact-pane { padding: 25px 4px 20px 24px; border-left-color: var(--shell-line); scrollbar-color: #c4c7bf transparent; }
+.artifact-pane .task-pane-heading { border-bottom-color: var(--shell-line); }
+.artifact-card { border-color: #dedfd8; background: #fbfbf7; }
+.artifact-card-heading { border-bottom-color: #e1e2dc; }
+.task-output { color: #373d37; }
+.task-output h1, .task-output h2, .task-output h3, .task-output h4 { color: #242924; }
+.task-output pre, .artifact-section pre { border-color: #2b302c; background: #1b201d; color: #e4e9e4; }
+.task-output code { color: #267c5f; }
+.task-output pre code { color: inherit; }
+.task-output blockquote { border-left-color: #83c8aa; color: #69716a; }
+.task-output a { color: #287c5e; }
+.task-output th { background: #eceee8; color: #303630; }
+.task-output th, .task-output td { border-color: #d9dbd3; }
+.artifact-placeholder { color: #818781; }
+.artifact-section-heading { border-bottom-color: var(--shell-line); }
+.artifact-section-heading h3 { color: #414841; }
+.artifact-section-heading > span { color: #7c827d; }
+.conversation-history { padding-top: 12px; border-top: 1px solid var(--shell-line); }
+.conversation-history > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #414841; cursor: pointer; font-size: 10px; font-weight: 550; }
+.conversation-history > summary span { color: #7c827d; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.artifact-section article, .tool-artifacts details { border-bottom-color: #e0e1db; }
+.artifact-section article p { color: #454c46; }
+.artifact-section article > span { color: #6d746e; }
+.conversation-history .history-message { padding: 12px 0; }
+.history-message header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.history-message header strong { color: #328d6d; font-size: 10px; font-weight: 600; }
+.history-message.user header strong { color: #59615a; }
+.history-message header time { color: #858b85; font-size: 9px; }
+.conversation-history .message-markdown { color: #454c46; font-size: 11px; }
+.conversation-history .message-markdown h1, .conversation-history .message-markdown h2,
+.conversation-history .message-markdown h3, .conversation-history .message-markdown h4 { color: #282e29; }
+.conversation-history .message-markdown blockquote { border-left-color: #83c8aa; color: #69716a; }
+.conversation-history .message-markdown a { color: #287c5e; }
+.tool-artifacts summary { color: #444b45; }
+.tool-output-icon { color: #328d6d; }
+.usage-meter { border-bottom-color: var(--shell-line); }
+.usage-meter > div { color: #737a73; }
+.usage-meter strong { color: #3e453f; }
+.run-controls { border-top-color: var(--shell-line); }
+.run-controls p { color: #626a63; }
+.run-controls button { border-color: #9bcdb5; background: #edf8f1; color: #287c5e; }
+
+.memory-workspace { width: 100%; height: auto; min-height: 0; flex: 1; overflow-y: auto; margin: 0; padding: 34px clamp(22px, 4vw, 56px); color: var(--shell-ink); }
+.memory-header { border-bottom-color: var(--shell-line); }
+.memory-header .eyebrow, .memory-editor .eyebrow, .memory-library-heading .eyebrow { color: #668879; }
+.memory-header h1, .memory-editor h2, .memory-library-heading h2 { color: #282d28; }
+.memory-header > div:first-child > p:last-child, .memory-editor > div > p:last-child { color: #777e78; }
+.memory-counts span { border-color: var(--shell-line); color: #6e756f; }
+.memory-counts strong { color: #353b35; }
+.memory-editor, .memory-card { border-color: #dedfd8; background: #fbfbf7; box-shadow: 0 8px 26px #30352d08; }
+.memory-field { color: #515851; }
+.memory-field select, .memory-field textarea, .memory-search input, .memory-category-filter select {
+  border-color: #d8dbd4;
+  border-radius: 8px;
+  background: #fff;
+  color: #303630;
+}
+.memory-field select:focus, .memory-field textarea:focus, .memory-search input:focus, .memory-category-filter select:focus { border-color: #77c9a9; outline-color: #77c9a9; }
+.memory-card { border-radius: 10px; }
+.memory-category { color: #328d6d; }
+.memory-status { background: #e3f5eb; color: #328d6d; }
+.memory-status.archived { background: #eeefeb; color: #747b75; }
+.memory-card > p { color: #3e453f; }
+.memory-card-footer { border-top-color: #e3e4de; color: #7c827d; }
+.memory-card-footer button { border-color: #d8dbd4; color: #555d56; }
+.memory-card-footer button:hover { border-color: #8fc9ad; color: #287c5e; }
+.memory-card-footer .delete-memory:hover { border-color: #d68d8d; color: #b94d4d; }
+.memory-empty { border-color: #c9cdc5; color: #737a73; }
+.archive-toggle { color: #5d655e; }
+.archive-toggle input { accent-color: #3da982; }
+.primary-button { background: var(--shell-mint); color: #17372b; }
+
+.auth-layout { min-height: calc(100vh - 72px); color: var(--shell-ink); }
+.intro h1 { color: #1f241f; }
+.intro h1 span { color: #5c7669; }
+.intro-copy, .card-copy { color: #6f776f; }
+.model-chips span { border-color: var(--shell-line); color: #555e56; }
+.auth-card { border-color: #dedfd8; border-radius: 18px; background: #fbfbf7; box-shadow: 0 20px 60px #29322812; }
+.auth-tabs { background: #eeefe9; }
+.auth-tabs button { color: #747b75; }
+.auth-tabs button.active { background: #fff; color: #282e29; box-shadow: 0 1px 3px #20282014; }
+.auth-card h2 { color: #262b26; }
+.card-copy { color: #777e78; }
+.field-label { color: #4e564f; }
+.field-label input { border-color: #d8dbd4; border-radius: 8px; background: #fff; color: #242924; }
+.field-label input:focus { border-color: #77c9a9; }
+.privacy-note { color: #7d847e; }
+.approval-overlay { background: #20241faa; }
+.approval-dialog { border-color: #dedfd8; border-radius: 16px; background: #fbfbf7; box-shadow: 0 24px 90px #20241f33; }
+.approval-close { border-color: #d8dbd4; background: #fff; color: #59615a; }
+.approval-eyebrow { color: #a27725; }
+.approval-dialog h2 { color: #272d28; }
+.approval-description { color: #687069; }
+.approval-action-name { border-color: #dedfd8; }
+.approval-action-name strong { color: #936c20; }
+.approval-arguments { border-color: #dedfd8; border-radius: 8px; background: #f0f1eb; color: #404740; }
+.approval-dialog-actions button { border-color: #d2d6cf; border-radius: 8px; color: #4e564f; }
+.approval-dialog-actions .approval-allow { border-color: #edc86f; background: #edc86f; color: #33280f; }
+.approval-dialog-actions .approval-deny:hover:not(:disabled) { border-color: #c46b6b; color: #b94d4d; }
+
+@media (max-width: 1000px) {
+  .workspace { grid-template-columns: 240px minmax(0, 1fr); }
+  .task-workspace { grid-template-columns: minmax(0, 1fr) minmax(280px, 0.88fr); }
+  .capability-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .workspace { height: auto; min-height: 100vh; display: flex; flex-direction: column; overflow: visible; }
+  .sidebar { position: static; width: 100%; height: auto; max-height: 38vh; flex: 0 0 auto; padding: 14px 12px; }
+  .sidebar-brand { margin: 0 8px 14px; }
+  .new-chat { min-height: 46px; }
+  .workspace-nav { grid-template-columns: 1fr 1fr; margin: 12px 0; padding-bottom: 12px; }
+  .workspace-nav button { min-height: 38px; }
+  .sidebar-heading { margin-top: 10px; }
+  .workspace-main { height: auto; min-height: calc(100vh - 38vh); overflow: visible; margin: 0; border-radius: 19px 19px 0 0; }
+  .workspace-topbar { position: sticky; top: 0; height: 66px; flex-basis: 66px; padding: 0 17px; border-radius: 19px 19px 0 0; }
+  .workspace-topbar .topbar-right { gap: 8px; font-size: 9px; }
+  .backend-error { display: none; }
+  .chat-area { height: auto; min-height: calc(100vh - 38vh - 66px); overflow: visible; padding: 0 18px 18px; }
+  .task-workspace { grid-template-columns: minmax(0, 1fr); }
+  .task-workspace.is-empty .task-main { min-height: 660px; grid-template-rows: minmax(120px, 1fr) auto auto minmax(14px, 0.25fr); }
+  .task-landing-intro { padding: 20px 4px 19px; }
+  .task-landing-intro .eyebrow { margin-bottom: 14px; font-size: 9px; }
+  .task-landing-intro h2 { font-size: clamp(36px, 10vw, 54px); }
+  .task-landing-intro > p:last-child { margin-top: 14px; font-size: 12px; }
+  .task-timeline-pane { min-height: 440px; overflow: visible; padding: 17px 0; }
+  .composer-wrap { position: sticky; padding: 10px 0 8px; }
+  .goal-composer-wrap { position: static; padding: 0 3px; }
+  .capabilities-panel { padding: 18px 3px 20px; }
+  .artifact-pane { min-height: 300px; max-height: none; overflow: visible; padding: 18px 0; border-top: 1px solid var(--shell-line); border-left: 0; }
+  .memory-workspace { min-height: calc(100vh - 38vh - 66px); padding: 25px 18px; }
+  .memory-layout, .memory-header { grid-template-columns: 1fr; }
+  .memory-header { align-items: flex-start; flex-direction: column; }
+  .memory-layout { display: grid; gap: 18px; }
+  .auth-layout { width: min(560px, 92vw); min-height: calc(100vh - 72px); grid-template-columns: 1fr; gap: 26px; padding: 35px 0; }
+  .intro h1 { font-size: clamp(40px, 10vw, 58px); }
+  .auth-card { padding: 22px; }
+}
+@media (max-width: 480px) {
+  .workspace-topbar { gap: 8px; }
+  .workspace-context { gap: 6px; font-size: 11px; }
+  .workspace-topbar .user-label { display: none; }
+  .workspace-topbar .backend-indicator { gap: 5px; }
+  .capability-grid { grid-template-columns: 1fr; }
+  .capability-card, .capability-card:nth-child(odd) { border-right: 1px solid #dedfd8; }
+  .composer-footer { align-items: flex-start; flex-direction: column; }
+  .composer-footer > span { max-width: 100%; }
+  .composer-actions { max-width: 100%; width: 100%; justify-content: flex-start; }
+  .memory-filters { grid-template-columns: 1fr; }
 }
 </style>
