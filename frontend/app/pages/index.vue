@@ -20,6 +20,7 @@ type ChatMessage = {
   content: string;
   created_at: string;
   pending?: boolean;
+  metadata?: Record<string, unknown> | null;
 };
 
 type AuthResponse = {
@@ -32,6 +33,7 @@ type ChatResponse = {
   reply: string;
   model: string;
   pending_approval_id?: string | null;
+  citations?: Array<{ title?: string; url: string; snippet?: string | null; provider?: string | null }>;
 };
 
 type ActivityEvent = {
@@ -85,6 +87,18 @@ type Memory = {
   updated_at: string;
 };
 
+type Artifact = {
+  id: string;
+  conversation_id: string;
+  agent_run_id?: string | null;
+  title: string;
+  kind: string;
+  mime_type: string;
+  content: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
 type WorkspaceView = 'chat' | 'memory';
 
 type AgentVisualStatus = 'idle' | 'thinking' | 'executing' | 'approval' | 'error';
@@ -121,7 +135,11 @@ const wsBase = runtimeConfig.public.wsBase;
 const token = useState<string | null>('aether-access-token', () => null);
 const user = ref<User | null>(null);
 const workspaceView = ref<WorkspaceView>('chat');
+const activeSidebarSection = ref<'home' | 'explore' | 'collection'>('home');
 const conversationSearch = ref('');
+const conversationSearchInput = ref<HTMLInputElement | null>(null);
+const sidebarWidth = ref(280);
+const sidebarResizing = ref(false);
 const localAuthMode = ref(false);
 const authModeLoaded = ref(false);
 const authMode = ref<'login' | 'register'>('login');
@@ -149,6 +167,7 @@ const eventCursors = ref<Record<string, number>>({});
 const approvals = ref<Approval[]>([]);
 const approvalModalId = ref<string | null>(null);
 const memories = ref<Memory[]>([]);
+const artifacts = ref<Artifact[]>([]);
 const memoryContent = ref('');
 const memoryType = ref<Memory['memory_type']>('preference');
 const memoryImportance = ref(3);
@@ -226,6 +245,13 @@ const latestAssistantOutput = computed(() => {
   if (busy.value && pendingMessage.value) return streamedReply.value;
   return [...messages.value].reverse().find((message) => message.role === 'assistant')?.content || streamedReply.value;
 });
+const latestAssistantCitations = computed(() => {
+  const latest = [...messages.value].reverse().find((message) => message.role === 'assistant');
+  const metadata = latest?.metadata as Record<string, unknown> | undefined;
+  return Array.isArray(metadata?.citations)
+    ? metadata.citations as Array<{ title?: string; url: string; snippet?: string | null; provider?: string | null }>
+    : [];
+});
 const conversationHistory = computed(() => {
   const latestAssistant = !busy.value
     ? [...messages.value].reverse().find((message) => message.role === 'assistant')
@@ -239,6 +265,14 @@ const currentActivityEvents = computed(() => currentRunEvents.value.filter((even
 ));
 const latestToolEvent = computed(() => currentToolEvents.value.at(-1));
 const isToolRunning = computed(() => latestToolEvent.value?.type === 'tool.started');
+const rollbackTaskId = computed(() => {
+  const event = currentToolEvents.value.find((item) =>
+    item.type === 'tool.completed'
+    && item.data.tool === 'create_task'
+  );
+  const output = event?.data.output as { task?: { id?: string } } | undefined;
+  return output?.task?.id || null;
+});
 const currentApprovalModal = computed(() => approvals.value.find((approval) => approval.id === approvalModalId.value) || null);
 
 function renderMessageMarkdown(content: string): string {
@@ -272,6 +306,16 @@ const currentRunEvents = computed(() => {
   return activityEvents.value
     .filter((event) => event.run_id === latestEvent.run_id)
     .sort((left, right) => left.sequence - right.sequence);
+});
+
+const currentDag = computed(() => {
+  const event = currentRunEvents.value.find((item) => item.type === 'dag.created');
+  return event?.data as {
+    execution_mode?: string;
+    parallel_supported?: boolean;
+    nodes?: Array<{ id: string; label: string; status: string; agent: string }>;
+    edges?: Array<{ from: string; to: string }>;
+  } | undefined;
 });
 
 const currentPlanProgress = computed<PlanProgress[]>(() => {
@@ -475,6 +519,12 @@ function activityDescription(event: ActivityEvent): string {
   if (event.type === 'plan.created') return 'Membuat rencana langkah';
   if (event.type === 'plan.step.started') return `Mulai langkah ${String(event.data.index || '')}`;
   if (event.type === 'plan.step.completed') return `Menyelesaikan langkah ${String(event.data.index || '')}`;
+  if (event.type === 'dag.created') return 'Menyusun DAG eksekusi';
+  if (event.type === 'subagent.started') return `Sub-agent mulai: ${String(event.data.node || 'worker')}`;
+  if (event.type === 'subagent.completed') return `Sub-agent selesai: ${String(event.data.node || 'worker')}`;
+  if (event.type === 'provider.retry') return `Retry provider ke-${String(event.data.attempt || 1)} (${String(event.data.reason || 'error')})`;
+  if (event.type === 'provider.recovered') return `Pemulihan berhasil setelah ${String(event.data.attempt || 1)} retry`;
+  if (event.type === 'artifact.created') return `Artifact dibuat: ${String(event.data.title || 'Dokumen')}`;
   if (event.type === 'workflow.stop_requested') return 'Permintaan berhenti diterima';
   if (event.type === 'workflow.pause_requested') return 'Menunggu checkpoint aman untuk jeda';
   if (event.type === 'workflow.paused') return 'Run dijeda pada checkpoint aman';
@@ -507,13 +557,13 @@ function activityTone(event: ActivityEvent): 'success' | 'running' | 'approval' 
     return 'approval';
   }
   if (
-    ['workflow.completed', 'plan.step.completed', 'tool.completed', 'agent.completed'].includes(event.type)
+    ['workflow.completed', 'plan.step.completed', 'tool.completed', 'agent.completed', 'provider.recovered', 'subagent.completed', 'artifact.created'].includes(event.type)
     || event.type === 'approval.approved'
   ) {
     return 'success';
   }
   if (
-    ['agent.started', 'plan.step.started', 'tool.started', 'workflow.stop_requested', 'workflow.pause_requested']
+    ['agent.started', 'plan.step.started', 'tool.started', 'provider.retry', 'subagent.started', 'dag.created', 'workflow.stop_requested', 'workflow.pause_requested']
       .includes(event.type)
   ) {
     return 'running';
@@ -567,7 +617,7 @@ async function initializeApplication(): Promise<void> {
     if (mode.local_auth) {
       busy.value = true;
       user.value = await $fetch<User>(`${apiBase}/auth/me`);
-      await Promise.all([loadConversations(), loadApprovals(), loadMemories()]);
+      await Promise.all([loadConversations(), loadApprovals(), loadMemories(), loadArtifacts()]);
     }
   } catch (error) {
     errorMessage.value = getErrorMessage(error);
@@ -594,7 +644,7 @@ async function authenticate(): Promise<void> {
     token.value = result.access_token;
     user.value = result.user;
     password.value = '';
-    await Promise.all([loadAgents(), loadConversations(), loadApprovals(), loadMemories()]);
+    await Promise.all([loadAgents(), loadConversations(), loadApprovals(), loadMemories(), loadArtifacts()]);
   } catch (error) {
     errorMessage.value = getErrorMessage(error);
   } finally {
@@ -654,6 +704,17 @@ async function loadMemories(): Promise<void> {
     return;
   }
   memories.value = await $fetch<Memory[]>(`${apiBase}/memory?active_only=false`, {
+    headers: authHeaders()
+  });
+}
+
+async function loadArtifacts(conversationId?: string | null): Promise<void> {
+  if (!token.value && !localAuthMode.value) {
+    artifacts.value = [];
+    return;
+  }
+  const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : '';
+  artifacts.value = await $fetch<Artifact[]>(`${apiBase}/artifacts${query}`, {
     headers: authHeaders()
   });
 }
@@ -830,11 +891,52 @@ async function openConversation(conversationId: string): Promise<void> {
       { headers: authHeaders() }
     );
     activeConversationId.value = conversationId;
+    activeSidebarSection.value = 'home';
+    await loadArtifacts(conversationId);
   } catch (error) {
     errorMessage.value = getErrorMessage(error);
   } finally {
     busy.value = false;
   }
+}
+
+function openHome(): void {
+  activeSidebarSection.value = 'home';
+  workspaceView.value = 'chat';
+}
+
+async function openExplore(): Promise<void> {
+  activeSidebarSection.value = 'explore';
+  workspaceView.value = 'chat';
+  await nextTick();
+  conversationSearchInput.value?.focus();
+}
+
+function openCollection(): void {
+  activeSidebarSection.value = 'collection';
+  workspaceView.value = 'memory';
+}
+
+function beginSidebarResize(event: PointerEvent): void {
+  if (window.innerWidth <= 760) return;
+  sidebarResizing.value = true;
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+  window.addEventListener('pointermove', resizeSidebar);
+  window.addEventListener('pointerup', endSidebarResize, { once: true });
+}
+
+function resizeSidebar(event: PointerEvent): void {
+  if (!sidebarResizing.value) return;
+  sidebarWidth.value = Math.min(420, Math.max(220, event.clientX));
+}
+
+function endSidebarResize(): void {
+  sidebarResizing.value = false;
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
+  window.removeEventListener('pointermove', resizeSidebar);
+  localStorage.setItem('aether-sidebar-width', String(sidebarWidth.value));
 }
 
 async function sendMessage(): Promise<void> {
@@ -876,6 +978,7 @@ async function sendMessage(): Promise<void> {
     await Promise.all([
       loadConversations(),
       openConversation(response.conversation_id),
+      loadArtifacts(response.conversation_id),
       response.pending_approval_id ? loadApprovals() : Promise.resolve()
     ]);
   } catch (error) {
@@ -1092,6 +1195,7 @@ function useSuggestedPrompt(prompt: string): void {
 
 function startNewTask(): void {
   disconnectActivity();
+  activeSidebarSection.value = 'home';
   workspaceView.value = 'chat';
   activeConversationId.value = null;
   messages.value = [];
@@ -1104,6 +1208,19 @@ function startNewTask(): void {
 
 function dismissApprovalModal(): void {
   approvalModalId.value = null;
+}
+
+async function rollbackCreatedTask(): Promise<void> {
+  if (!rollbackTaskId.value) return;
+  try {
+    await $fetch(`${apiBase}/tasks/${rollbackTaskId.value}`, {
+      method: 'DELETE',
+      headers: authHeaders()
+    });
+    await loadConversations();
+  } catch (error) {
+    errorMessage.value = getErrorMessage(error);
+  }
 }
 
 function signOut(): void {
@@ -1132,11 +1249,18 @@ watch(activeConversationId, () => {
 });
 watch([token, activeConversationId, localAuthMode], connectActivity);
 onMounted(() => {
+  const savedSidebarWidth = Number(localStorage.getItem('aether-sidebar-width'));
+  if (savedSidebarWidth >= 220 && savedSidebarWidth <= 420) {
+    sidebarWidth.value = savedSidebarWidth;
+  }
   initializeVoiceSupport();
   void initializeApplication();
 });
 onBeforeUnmount(() => {
   disconnectActivity();
+  window.removeEventListener('pointermove', resizeSidebar);
+  document.body.style.cursor = '';
+  document.body.style.userSelect = '';
   speechRecognition?.stop();
   if ('speechSynthesis' in window) {
     window.speechSynthesis.cancel();
@@ -1206,14 +1330,14 @@ onBeforeUnmount(() => {
       </form>
     </section>
 
-    <section v-else class="workspace">
+    <section v-else class="workspace" :style="{ '--sidebar-width': `${sidebarWidth}px` }" :class="{ 'sidebar-resizing': sidebarResizing }">
       <aside class="sidebar">
         <a class="brand sidebar-brand" href="/" aria-label="Aether — beranda" :title="agentVisualLabel">
           <span class="brand-mark" :class="agentVisualStatus" aria-hidden="true">
             <img src="/aether-monogram.png" alt="" />
             <span v-if="agentVisualStatus === 'approval'" class="brand-approval-dot" />
           </span>
-          <span class="brand-name">Aether</span>
+          <span class="brand-name">ÆTHER</span>
         </a>
         <button class="new-chat" type="button" :disabled="busy" @click="startNewTask">
           <span aria-hidden="true">＋</span> Percakapan baru
@@ -1221,26 +1345,43 @@ onBeforeUnmount(() => {
         <nav class="workspace-nav" aria-label="Workspace">
           <button
             type="button"
-            :class="{ selected: workspaceView === 'chat' }"
-            @click="workspaceView = 'chat'"
+            :class="{ selected: activeSidebarSection === 'home' }"
+            @click="openHome"
           >
-            <span aria-hidden="true">⌘</span> Workspace
+            <svg aria-hidden="true" viewBox="0 0 20 20">
+              <path d="m3 9 7-6 7 6M5 8v9h10V8M8 17v-5h4v5" />
+            </svg>
+            Beranda
           </button>
           <button
             type="button"
-            :class="{ selected: workspaceView === 'memory' }"
-            @click="workspaceView = 'memory'"
+            :class="{ selected: activeSidebarSection === 'explore' }"
+            @click="openExplore"
           >
-            <span aria-hidden="true">◇</span> Memory
+            <svg aria-hidden="true" viewBox="0 0 20 20">
+              <circle cx="8.5" cy="8.5" r="5.5" />
+              <path d="m13 13 4 4" />
+            </svg>
+            Jelajahi
+          </button>
+          <button
+            type="button"
+            :class="{ selected: activeSidebarSection === 'collection' }"
+            @click="openCollection"
+          >
+            <svg aria-hidden="true" viewBox="0 0 20 20">
+              <path d="M2.5 5.5h6l1.5 2h7.5v9h-15zM2.5 7.5v-2a1.5 1.5 0 0 1 1.5-1.5h3l1.5 1.5" />
+            </svg>
+            Koleksi
             <span class="nav-count">{{ activeMemoryCount }}</span>
           </button>
         </nav>
 
         <template v-if="workspaceView === 'chat'">
-          <p class="sidebar-heading">RECENT TASKS</p>
-          <label class="conversation-search">
+          <p class="sidebar-heading">TERBARU</p>
+          <label v-if="activeSidebarSection === 'explore' || conversationSearch" class="conversation-search">
             <span class="visually-hidden">Cari percakapan</span>
-            <input v-model="conversationSearch" type="search" placeholder="Cari percakapan…" />
+            <input ref="conversationSearchInput" v-model="conversationSearch" type="search" placeholder="Cari percakapan…" />
           </label>
           <button
             v-for="conversation in visibleConversations"
@@ -1250,27 +1391,45 @@ onBeforeUnmount(() => {
             type="button"
             @click="openConversation(conversation.id)"
           >
-            <span class="conversation-icon" aria-hidden="true">◌</span>
+            <span class="conversation-icon" aria-hidden="true" />
             <span>{{ conversation.title }}</span>
           </button>
           <p v-if="conversations.length === 0" class="empty-history">Belum ada percakapan.</p>
           <p v-else-if="visibleConversations.length === 0" class="empty-history">Tidak ada percakapan yang cocok.</p>
 
-          <div class="sidebar-section-heading approval-heading" :class="{ 'has-approvals': approvals.length > 0 }">
-            <p class="sidebar-heading">PERSETUJUAN</p>
-            <span class="approval-count">{{ approvals.length }}</span>
-          </div>
-          <article v-for="approval in approvals" :key="approval.id" class="sidebar-card approval-card">
-            <p>{{ approval.tool_name === 'create_task' ? 'Buat tugas' : approval.tool_name }}</p>
-            <span>{{ approval.tool_arguments.title || 'Tindakan memerlukan persetujuanmu.' }}</span>
-            <div class="approval-actions">
-              <button type="button" :disabled="busy" @click="decideApproval(approval, true)">Setujui</button>
-              <button type="button" :disabled="busy" @click="decideApproval(approval, false)">Tolak</button>
+          <section v-if="approvals.length" class="sidebar-approvals" aria-label="Persetujuan">
+            <div class="sidebar-section-heading approval-heading has-approvals">
+              <p class="sidebar-heading">PERSETUJUAN</p>
+              <span class="approval-count">{{ approvals.length }}</span>
             </div>
-          </article>
-          <p v-if="approvals.length === 0" class="sidebar-empty approval-empty">Tidak ada tindakan yang menunggu.</p>
+            <article v-for="approval in approvals" :key="approval.id" class="sidebar-card approval-card">
+              <p>{{ approval.tool_name === 'create_task' ? 'Buat tugas' : approval.tool_name }}</p>
+              <span>{{ approval.tool_arguments.title || 'Tindakan memerlukan persetujuanmu.' }}</span>
+              <div class="approval-actions">
+                <button type="button" :disabled="busy" @click="decideApproval(approval, true)">Setujui</button>
+                <button type="button" :disabled="busy" @click="decideApproval(approval, false)">Tolak</button>
+              </div>
+            </article>
+          </section>
         </template>
+
+        <div class="sidebar-footer">
+          <div class="sidebar-profile">
+            <span class="sidebar-avatar" aria-hidden="true"><img src="/aether-monogram.png" alt="" /></span>
+            <span class="sidebar-profile-copy">
+              <strong>{{ user?.name || 'Aether' }}</strong>
+              <small>{{ localAuthMode ? 'Workspace lokal' : user?.email || 'Personal workspace' }}</small>
+            </span>
+          </div>
+        </div>
       </aside>
+      <button
+        class="sidebar-resizer"
+        type="button"
+        aria-label="Sesuaikan lebar sidebar"
+        title="Geser untuk mengubah lebar sidebar"
+        @pointerdown.prevent="beginSidebarResize"
+      ><span /></button>
 
       <div class="workspace-main">
         <header class="workspace-topbar">
@@ -1342,6 +1501,20 @@ onBeforeUnmount(() => {
                     <span class="plan-step-status">
                       {{ step.status === 'completed' ? 'Selesai' : step.status === 'in_progress' ? 'Berjalan' : step.status === 'stopped' ? 'Terhenti' : step.status === 'paused' ? 'Dijeda' : 'Menunggu' }}
                     </span>
+                  </li>
+                </ol>
+              </div>
+
+              <div v-if="currentDag?.nodes?.length" class="dag-view" aria-label="Task dependency graph">
+                <p class="agent-list-label">TASK DAG <span>{{ currentDag.parallel_supported ? 'PARALLEL READY' : 'SEQUENTIAL' }}</span></p>
+                <ol>
+                  <li v-for="(node, index) in currentDag.nodes" :key="node.id" :class="{ active: node.status === 'in_progress' }">
+                    <span class="dag-node-index">{{ String(index + 1).padStart(2, '0') }}</span>
+                    <span class="dag-node-copy">
+                      <strong>{{ node.label }}</strong>
+                      <small>{{ node.agent }}</small>
+                    </span>
+                    <span v-if="index < (currentDag.nodes?.length || 0) - 1" class="dag-edge" aria-hidden="true">→</span>
                   </li>
                 </ol>
               </div>
@@ -1542,6 +1715,39 @@ onBeforeUnmount(() => {
                 <summary><span class="tool-output-icon">✓</span>{{ String(event.data.tool || 'Tool') }}</summary>
                 <pre>{{ formatRunValue(event.data.output) }}</pre>
               </details>
+            </section>
+
+            <section v-if="artifacts.length" class="artifact-section saved-artifacts">
+              <div class="artifact-section-heading">
+                <h3>Saved artifacts</h3>
+                <span>{{ artifacts.length }}</span>
+              </div>
+              <details v-for="artifact in artifacts" :key="artifact.id">
+                <summary><span class="tool-output-icon">◆</span>{{ artifact.title }}</summary>
+                <div class="artifact-preview">
+                  <span>{{ artifact.kind }} · {{ artifact.mime_type }}</span>
+                  <div v-if="artifact.mime_type.includes('markdown') || artifact.mime_type.includes('text')" class="message-markdown" v-html="renderMessageMarkdown(artifact.content)" />
+                  <pre v-else>{{ artifact.content }}</pre>
+                </div>
+              </details>
+            </section>
+
+            <section v-if="latestAssistantCitations.length" class="artifact-section citation-artifacts">
+              <div class="artifact-section-heading">
+                <h3>Sources</h3>
+                <span>{{ latestAssistantCitations.length }}</span>
+              </div>
+              <a v-for="citation in latestAssistantCitations" :key="citation.url" :href="citation.url" target="_blank" rel="noopener noreferrer">
+                <strong>{{ citation.title || citation.url }}</strong>
+                <span>{{ citation.url }}</span>
+                <small v-if="citation.snippet">{{ citation.snippet }}</small>
+              </a>
+            </section>
+
+            <section v-if="rollbackTaskId" class="artifact-section rollback-artifacts">
+              <button type="button" @click="rollbackCreatedTask">
+                Undo · hapus tugas yang baru dibuat
+              </button>
             </section>
 
             <div v-if="currentRunEvents.length" class="usage-meter artifact-usage" aria-label="Penggunaan model">
@@ -2520,10 +2726,37 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
   width: 100%;
   height: 100vh;
   min-height: 620px;
-  grid-template-columns: 280px minmax(0, 1fr);
+  position: relative;
+  grid-template-columns: var(--sidebar-width, 280px) minmax(0, 1fr);
   overflow: hidden;
   background: var(--shell-paper);
 }
+.sidebar-resizer {
+  position: absolute;
+  z-index: 12;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sidebar-width, 280px) - 3px);
+  width: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sidebar-resizer span {
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  width: 3px;
+  height: 44px;
+  border-radius: 99px;
+  background: transparent;
+  transform: translateY(-50%);
+  transition: background 140ms ease;
+}
+.sidebar-resizer:hover span,
+.sidebar-resizing .sidebar-resizer span { background: #78bda3; }
 .sidebar {
   position: relative;
   height: 100vh;
@@ -2534,32 +2767,45 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
   overflow-y: auto;
   padding: 24px 14px 18px;
   border: 0;
-  background: var(--shell-sidebar);
+  background: #181a18;
   scrollbar-color: #3a403c transparent;
 }
-.sidebar-brand { width: fit-content; height: 34px; margin: 0 12px 30px; gap: 9px; }
-.sidebar-brand .brand-mark { width: 26px; height: 26px; }
-.sidebar-brand .brand-name { color: #f3f5f0; font-size: 16px; }
+.sidebar-brand { width: fit-content; height: 36px; margin: 0 12px 30px; gap: 8px; }
+.sidebar-brand .brand-mark {
+  order: 2;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: #54ddb1;
+  box-shadow: 0 0 8px #54ddb166;
+}
+.sidebar-brand .brand-mark img, .sidebar-brand .brand-approval-dot { display: none; }
+.sidebar-brand .brand-mark.executing { box-shadow: 0 0 11px #54ddb199; }
+.sidebar-brand .brand-mark.thinking { animation: aether-thinking-pulse 1.8s ease-in-out infinite; }
+.sidebar-brand .brand-mark.approval { background: #edc86f; box-shadow: 0 0 8px #edc86f88; }
+.sidebar-brand .brand-mark.error { background: #d56666; box-shadow: 0 0 8px #d5666688; }
+.sidebar-brand .brand-name { order: 1; color: #58e3b5; font-size: 26px; font-weight: 750; letter-spacing: -0.085em; }
 .brand-mark img { filter: drop-shadow(0 0 4px #54e4b422); }
 .brand-mark.executing img { filter: drop-shadow(0 0 8px #54e4b488); }
 .new-chat {
-  min-height: 54px;
-  padding: 12px 15px;
+  min-height: 48px;
+  padding: 10px 14px;
   border: 0;
-  border-radius: 13px;
+  border-radius: 15px;
   background: var(--shell-mint);
   color: #14251e;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 .new-chat:hover { border-color: transparent; background: #68e9be; }
 .new-chat span { color: #173a2d; }
-.workspace-nav { gap: 5px; margin: 22px 0 22px; padding-bottom: 20px; border-bottom-color: #ffffff16; }
-.workspace-nav button { min-height: 45px; padding: 10px 12px; border-radius: 11px; color: #9da69f; font-size: 13px; }
-.workspace-nav button:hover, .workspace-nav button.selected { background: #292d2a; color: #f5f6f2; }
-.workspace-nav button > span:first-child { width: 19px; color: #a7b0a9; font-size: 16px; }
+.workspace-nav { gap: 3px; margin: 18px 0 16px; padding-bottom: 0; border-bottom: 0; }
+.workspace-nav button { min-height: 44px; padding: 8px 12px; border-radius: 10px; color: #a0a8a1; font-size: 13px; }
+.workspace-nav button:hover, .workspace-nav button.selected { background: #292b29; color: #f5f6f2; }
+.workspace-nav button svg { width: 20px; height: 20px; flex: 0 0 20px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
 .nav-count { color: #75e6bd; }
-.sidebar-heading { margin: 14px 14px 10px; color: #7f8981; font-size: 9px; letter-spacing: 0.15em; }
+.sidebar-heading { margin: 17px 14px 13px; color: #7f8981; font-size: 10px; letter-spacing: 0.15em; }
 .conversation-search { margin: 0 0 9px; }
 .conversation-search input {
   padding: 10px 11px;
@@ -2571,9 +2817,10 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 }
 .conversation-search input::placeholder { color: #828b84; }
 .conversation-search input:focus { border-color: #70d8b2; }
-.conversation-item { min-height: 42px; margin: 2px 0; padding: 10px 11px; border-radius: 8px; color: #aab2ac; font-size: 11px; }
+.conversation-item { min-height: 50px; margin: 2px 0; padding: 10px 16px; border-radius: 8px; color: #aab2ac; font-size: 13px; }
 .conversation-item.selected, .conversation-item:hover { background: #242925; color: #f1f3ef; }
-.conversation-icon { color: #89968d; }
+.conversation-icon { position: relative; width: 15px; height: 12px; flex: 0 0 15px; border: 1px solid #89968d; border-radius: 4px; color: #89968d; font-size: 0; }
+.conversation-icon::after { position: absolute; bottom: -3px; left: 3px; width: 4px; height: 4px; border-bottom: 1px solid currentColor; border-left: 1px solid currentColor; background: #181a18; content: ""; transform: skewY(-38deg); }
 .empty-history, .sidebar-empty { color: #838d85; }
 .sidebar-section-heading.approval-heading { margin-top: 20px; padding: 10px 12px; border-color: #3b413c; }
 .approval-heading .sidebar-heading { color: #9ba49d; }
@@ -2585,6 +2832,15 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .sidebar-card > span { color: #a8b0aa; }
 .approval-actions button { border-color: #454c46; border-radius: 7px; background: #292e2a; color: #d6ddd6; }
 .approval-actions button:first-child { border-color: #92733b; background: #302819; color: #f0c66f; }
+.sidebar-approvals { margin-top: 14px; }
+.sidebar-approvals .approval-heading { margin-top: 0; }
+.sidebar-footer { margin-top: auto; padding-top: 18px; }
+.sidebar-profile { display: flex; align-items: center; gap: 12px; min-height: 61px; margin: 14px 8px 0; }
+.sidebar-avatar { width: 44px; height: 44px; display: grid; flex: 0 0 44px; place-items: center; border-radius: 13px; background: #303832; }
+.sidebar-avatar img { width: 24px; height: 24px; object-fit: contain; }
+.sidebar-profile-copy { min-width: 0; display: grid; gap: 4px; }
+.sidebar-profile-copy strong { color: #eef0ec; font-size: 13px; font-weight: 600; }
+.sidebar-profile-copy small { overflow: hidden; color: #89938b; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 
 .workspace-main {
   min-width: 0;
@@ -2620,14 +2876,16 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .chat-area { height: auto; min-height: 0; flex: 1; overflow: hidden; padding: 0 clamp(20px, 3.2vw, 48px) 20px; background: var(--shell-paper); }
 .task-workspace { grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr); }
 .task-main { color: var(--shell-ink); }
-.task-workspace.is-empty .task-main { grid-template-rows: minmax(0, 1fr) auto auto minmax(0, 0.35fr); }
-.task-landing-intro { width: min(940px, 100%); align-self: end; padding: 0 16px 27px; text-align: center; }
+.task-workspace.is-empty .task-main { display: flex; flex-direction: column; overflow-y: auto; }
+.task-main { align-items: center; }
+.task-main > * { box-sizing: border-box; }
+.task-landing-intro { width: min(1280px, 100%); flex: 1 0 auto; min-height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: center; align-self: center; padding: 52px 0 28px; text-align: center; }
 .task-landing-intro .eyebrow { margin-bottom: 18px; color: #479f82; font-family: inherit; font-size: 11px; letter-spacing: 0.18em; }
 .task-landing-intro h2 {
   margin: 0;
   color: #1d211e;
   font-family: Georgia, "Times New Roman", serif;
-  font-size: clamp(42px, 5.2vw, 72px);
+  font-size: clamp(42px, 4.2vw, 64px);
   font-weight: 700;
   line-height: 1.02;
   letter-spacing: -0.055em;
@@ -2679,11 +2937,21 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .process-summary li span { color: #727972; }
 .process-summary small, .usage-meter small { color: #818781; }
 .composer-wrap { background: linear-gradient(180deg, #f2f2ec00 0%, #f2f2ec 18%); }
+.goal-composer-wrap { width: min(1280px, 100%) !important; justify-self: center; align-self: center; padding: 0 !important; }
+.task-composer { box-sizing: border-box; }
 .task-composer { border-color: #d7dad2; border-radius: 11px; background: #fbfbf7; box-shadow: 0 8px 26px #30352d0b; }
 .task-composer:focus-within { border-color: #77c9a9; }
 .task-composer textarea { color: #303630; }
 .task-composer textarea::placeholder { color: #888f88; }
-.composer-footer { color: #868c86; }
+.composer-footer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  color: #868c86;
+}
+.composer-footer > span { min-width: 0; }
+.composer-actions { min-width: 0; justify-content: flex-end; }
 .inline-model-select select, .voice-toggle, .voice-button { border-color: #d8dbd4; background: #f7f7f2; color: #555d56; }
 .voice-toggle[aria-pressed="true"] { border-color: #a8d7c3; color: #338567; }
 .voice-button.listening { border-color: #d6bd80; background: #fcf8ed; color: #a27725; }
@@ -2692,8 +2960,9 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .pause-button { border-color: #d6bd80; background: #fcf8ed; color: #916c24; }
 .stop-button { border-color: #d8a2a2; background: #fff6f5; color: #b94d4d; }
 .voice-privacy, .voice-status { color: #858b85; }
-.capabilities-panel { width: min(1080px, 100%); padding: 24px 8px 0; }
-.capabilities-heading { justify-content: center; margin-bottom: 13px; }
+.capabilities-panel { width: min(1280px, 100%); padding: 24px 0 0; box-sizing: border-box; }
+.capabilities-heading { justify-content: flex-start; margin: 0 0 13px; }
+.capabilities-heading h2 { margin: 0; }
 .capabilities-heading .eyebrow { display: none; }
 .capabilities-heading h2 { color: #777e78; font-size: 11px; font-weight: 500; }
 .capabilities-heading > span { display: none; }
@@ -2754,6 +3023,24 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .usage-meter { border-bottom-color: var(--shell-line); }
 .usage-meter > div { color: #737a73; }
 .usage-meter strong { color: #3e453f; }
+.dag-view { margin-top: 18px; }
+.dag-view > .agent-list-label { display: flex; justify-content: space-between; }
+.dag-view > .agent-list-label span { color: #328d6d; }
+.dag-view ol { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.dag-view li { display: grid; grid-template-columns: 26px minmax(0, 1fr) 18px; align-items: center; gap: 8px; min-height: 38px; }
+.dag-node-index { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid #d5d8d0; border-radius: 50%; color: #737a73; font-size: 9px; }
+.dag-node-copy { display: grid; gap: 3px; }
+.dag-node-copy strong { color: #414841; font-size: 10px; }
+.dag-node-copy small { color: #858c85; font-size: 8px; }
+.dag-edge { color: #8e9690; text-align: center; }
+.saved-artifacts details { padding: 9px 0; border-bottom: 1px solid #e0e1db; }
+.saved-artifacts summary { display: flex; gap: 8px; color: #444b45; cursor: pointer; font-size: 10px; }
+.artifact-preview { margin-top: 9px; }
+.artifact-preview > span { display: block; margin-bottom: 7px; color: #858c85; font-size: 8px; }
+.citation-artifacts a { display: grid; gap: 4px; padding: 9px 0; border-bottom: 1px solid #e0e1db; color: #287c5e; text-decoration: none; }
+.citation-artifacts a strong { font-size: 10px; }
+.citation-artifacts a span, .citation-artifacts a small { overflow-wrap: anywhere; color: #747b75; font-size: 8px; }
+.rollback-artifacts button { width: 100%; padding: 9px 10px; border: 1px solid #d8b58b; border-radius: 8px; background: #fff8e9; color: #916c24; font-size: 9px; }
 .run-controls { border-top-color: var(--shell-line); }
 .run-controls p { color: #626a63; }
 .run-controls button { border-color: #9bcdb5; background: #edf8f1; color: #287c5e; }
@@ -2817,16 +3104,17 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .approval-dialog-actions .approval-deny:hover:not(:disabled) { border-color: #c46b6b; color: #b94d4d; }
 
 @media (max-width: 1000px) {
-  .workspace { grid-template-columns: 240px minmax(0, 1fr); }
+  .workspace { grid-template-columns: var(--sidebar-width, 280px) minmax(0, 1fr); }
   .task-workspace { grid-template-columns: minmax(0, 1fr) minmax(280px, 0.88fr); }
   .capability-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   .workspace { height: auto; min-height: 100vh; display: flex; flex-direction: column; overflow: visible; }
+  .sidebar-resizer { display: none; }
   .sidebar { position: static; width: 100%; height: auto; max-height: 38vh; flex: 0 0 auto; padding: 14px 12px; }
   .sidebar-brand { margin: 0 8px 14px; }
   .new-chat { min-height: 46px; }
-  .workspace-nav { grid-template-columns: 1fr 1fr; margin: 12px 0; padding-bottom: 12px; }
+  .workspace-nav { grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 12px 0; padding-bottom: 12px; }
   .workspace-nav button { min-height: 38px; }
   .sidebar-heading { margin-top: 10px; }
   .workspace-main { height: auto; min-height: calc(100vh - 38vh); overflow: visible; margin: 0; border-radius: 19px 19px 0 0; }

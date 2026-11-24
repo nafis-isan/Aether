@@ -15,7 +15,7 @@ from app.ai.openrouter import OpenRouterClient, OpenRouterError
 from app.ai.planning import needs_explicit_plan, parse_goal_plan
 from app.browser.manager import BrowserUnavailableError
 from app.config import settings
-from app.database.models import AgentRun
+from app.database.models import AgentRun, Artifact
 from app.services.workflow import emit_event, persist_checkpoint
 from app.tools.registry import execute_tool_call, tool_definitions_for
 
@@ -33,6 +33,7 @@ class WorkflowState(TypedDict, total=False):
     answer: str
     reasoning_details: Any
     usage: dict[str, Any] | None
+    citations: list[dict[str, Any]]
     continuation_messages: list[dict[str, Any]]
     pending_tool_call: dict[str, Any]
     pending_approval_id: str
@@ -172,9 +173,25 @@ async def _complete_with_limits(
         },
     )
     delta_queue: asyncio.Queue[str] = asyncio.Queue()
+    retry_attempts = {"count": 0}
 
     async def enqueue_delta(text: str) -> None:
         await delta_queue.put(text)
+
+    async def emit_retry(attempt: int, reason: str) -> None:
+        retry_attempts["count"] = attempt
+        await emit_event(
+            session,
+            run_id=run.id,
+            agent_name=state.get("selected_agent", "aether_core"),
+            event_type="provider.retry",
+            payload={
+                "attempt": attempt,
+                "reason": reason,
+                "status": "retrying",
+                "model": state["model_id"],
+            },
+        )
 
     completion_task = asyncio.create_task(
         client.complete(
@@ -183,6 +200,7 @@ async def _complete_with_limits(
             tools=tools,
             response_format=response_format,
             on_text_delta=enqueue_delta if on_text_delta is not None else None,
+            on_retry=emit_retry,
         )
     )
     delta_task = asyncio.create_task(delta_queue.get()) if on_text_delta is not None else None
@@ -211,6 +229,18 @@ async def _complete_with_limits(
                 while not delta_queue.empty():
                     await on_text_delta(delta_queue.get_nowait())
                 completion = completion_task.result()
+                if retry_attempts["count"] > 0:
+                    await emit_event(
+                        session,
+                        run_id=run.id,
+                        agent_name=state.get("selected_agent", "aether_core"),
+                        event_type="provider.recovered",
+                        payload={
+                            "attempt": retry_attempts["count"],
+                            "status": "recovered",
+                            "model": state["model_id"],
+                        },
+                    )
                 break
             await _ensure_run_active(session, run_id=run.id, state=call_state)
     except (WorkflowCancelled, WorkflowLimitReached):
@@ -396,6 +426,29 @@ def build_workflow(
                 "max_steps": settings.agent_max_plan_steps,
             },
         )
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="aether_core",
+            event_type="dag.created",
+            payload={
+                "execution_mode": "sequential",
+                "parallel_supported": False,
+                "nodes": [
+                    {
+                        "id": f"step-{index + 1}",
+                        "label": step,
+                        "status": "pending",
+                        "agent": agent,
+                    }
+                    for index, step in enumerate(steps)
+                ],
+                "edges": [
+                    {"from": f"step-{index}", "to": f"step-{index + 1}"}
+                    for index in range(1, len(steps))
+                ],
+            },
+        )
         return planned_state
 
     async def worker(state: WorkflowState) -> WorkflowState:
@@ -437,6 +490,18 @@ def build_workflow(
         while step_index < len(plan):
             await _ensure_run_active(session, run_id=state["run_id"], state=working_state)
             step = plan[step_index]
+            await emit_event(
+                session,
+                run_id=state["run_id"],
+                agent_name=agent,
+                event_type="subagent.started",
+                payload={
+                    "subagent": agent,
+                    "node": f"step-{step_index + 1}",
+                    "status": "working",
+                    "mode": "sequential",
+                },
+            )
             plan[step_index] = {**step, "status": "in_progress"}
             step_state: WorkflowState = {
                 **working_state,
@@ -676,6 +741,7 @@ def build_workflow(
             step_results.append(
                 {"index": step_index + 1, "description": step["description"], "result": result_text}
             )
+            completed_node_index = step_index + 1
             step_index += 1
             working_state = {
                 **working_state,
@@ -684,7 +750,24 @@ def build_workflow(
                 "step_results": step_results,
                 "answer": result_text,
                 "reasoning_details": completion.get("reasoning_details"),
+                "citations": completion.get("citations") or [],
             }
+            artifact = Artifact(
+                user_id=state["user_id"],
+                conversation_id=state["conversation_id"],
+                agent_run_id=state["run_id"],
+                title=f"Step {completed_node_index}: {step['description'][:120]}",
+                kind="document",
+                mime_type="text/markdown",
+                content=result_text,
+                metadata_json={
+                    "plan_index": completed_node_index,
+                    "citations": completion.get("citations") or [],
+                    "agent": agent,
+                },
+            )
+            session.add(artifact)
+            await session.flush()
             await persist_checkpoint(
                 session,
                 run_id=state["run_id"],
@@ -700,6 +783,30 @@ def build_workflow(
                     "index": step_index,
                     "description": step["description"],
                     "summary": result_text[:1200],
+                },
+            )
+            await emit_event(
+                session,
+                run_id=state["run_id"],
+                agent_name=agent,
+                event_type="subagent.completed",
+                payload={
+                    "subagent": agent,
+                    "node": f"step-{completed_node_index}",
+                    "status": "completed",
+                    "mode": "sequential",
+                },
+            )
+            await emit_event(
+                session,
+                run_id=state["run_id"],
+                agent_name=agent,
+                event_type="artifact.created",
+                payload={
+                    "artifact_id": artifact.id,
+                    "title": artifact.title,
+                    "kind": artifact.kind,
+                    "mime_type": artifact.mime_type,
                 },
             )
             await _pause_if_requested(

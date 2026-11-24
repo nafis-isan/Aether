@@ -1,4 +1,5 @@
 from app.database.models.approval import Approval
+from app.database.models.artifact import Artifact
 from app.database.models.agent_checkpoint import AgentCheckpoint
 from app.database.models.agent_event import AgentEvent
 from app.database.models.agent_run import AgentRun
@@ -11,6 +12,7 @@ from app.database.models.user import User
 
 __all__ = [
     "Approval",
+    "Artifact",
     "AgentCheckpoint",
     "AgentEvent",
     "AgentRun",

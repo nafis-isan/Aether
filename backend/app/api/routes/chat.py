@@ -204,6 +204,7 @@ async def send_chat_message(
             "model": completion["model_id"],
             "reasoning_details": completion.get("reasoning_details"),
             "usage": completion.get("usage"),
+            "citations": completion.get("citations") or [],
             "agent": completion["selected_agent"],
             "agent_run_id": run.id,
             "pending_approval_id": completion.get("pending_approval_id"),
@@ -244,6 +245,7 @@ async def send_chat_message(
         run_id=run.id,
         selected_agent=completion["selected_agent"],
         pending_approval_id=completion.get("pending_approval_id"),
+        citations=completion.get("citations") or [],
     )
 
 

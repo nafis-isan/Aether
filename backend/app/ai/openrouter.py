@@ -18,6 +18,25 @@ class OpenRouterError(Exception):
         self.retryable = retryable
 
 
+def normalize_citations(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    citations: list[dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if isinstance(item, str):
+            citations.append({"title": f"Source {index}", "url": item})
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("source") or item.get("link")
+            if isinstance(url, str) and url:
+                citations.append({
+                    "title": item.get("title") if isinstance(item.get("title"), str) else f"Source {index}",
+                    "url": url,
+                    "snippet": item.get("snippet") if isinstance(item.get("snippet"), str) else None,
+                    "provider": item.get("provider") if isinstance(item.get("provider"), str) else None,
+                })
+    return citations
+
+
 class OpenRouterClient:
     def __init__(
         self,
@@ -36,6 +55,7 @@ class OpenRouterClient:
         tools: list[dict[str, Any]] | None = None,
         response_format: dict[str, str] | None = None,
         on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        on_retry: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         if not settings.openrouter_api_key:
             raise OpenRouterError("configuration_error", "The AI provider is not configured.")
@@ -74,17 +94,22 @@ class OpenRouterClient:
                     model=model,
                     retries=retries,
                     on_text_delta=on_text_delta,
+                    on_retry=on_retry,
                 )
             for attempt in range(retries + 1):
                 try:
                     response = await client.post(url, headers=headers, json=payload)
                 except httpx.TimeoutException:
                     if attempt < retries:
+                        if on_retry is not None:
+                            await on_retry(attempt + 1, "timeout")
                         await self._backoff(attempt)
                         continue
                     raise OpenRouterError("timeout", "The AI provider took too long to respond.") from None
                 except httpx.RequestError:
                     if attempt < retries:
+                        if on_retry is not None:
+                            await on_retry(attempt + 1, "provider_unavailable")
                         await self._backoff(attempt)
                         continue
                     raise OpenRouterError("provider_unavailable", "The AI provider is temporarily unavailable.") from None
@@ -95,11 +120,15 @@ class OpenRouterClient:
                     raise OpenRouterError("model_unavailable", "The configured AI model is unavailable.")
                 if response.status_code == 429:
                     if attempt < retries:
+                        if on_retry is not None:
+                            await on_retry(attempt + 1, "rate_limited")
                         await self._backoff(attempt)
                         continue
                     raise OpenRouterError("rate_limited", "The AI provider is rate limiting requests.")
                 if response.status_code >= 500:
                     if attempt < retries:
+                        if on_retry is not None:
+                            await on_retry(attempt + 1, "provider_error")
                         await self._backoff(attempt)
                         continue
                     raise OpenRouterError("provider_unavailable", "The AI provider is temporarily unavailable.")
@@ -125,6 +154,7 @@ class OpenRouterClient:
                     "tool_calls": tool_calls,
                     "model": body.get("model", model),
                     "usage": usage if isinstance(usage, dict) else None,
+                    "citations": normalize_citations(body.get("citations")),
                 }
 
         raise OpenRouterError("provider_unavailable", "The AI provider is temporarily unavailable.")
@@ -139,6 +169,7 @@ class OpenRouterClient:
         model: str,
         retries: int,
         on_text_delta: Callable[[str], Awaitable[None]],
+        on_retry: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         for attempt in range(retries + 1):
             emitted_text = False
@@ -153,11 +184,15 @@ class OpenRouterClient:
                         raise OpenRouterError("model_unavailable", "The configured AI model is unavailable.")
                     if response.status_code == 429:
                         if attempt < retries:
+                            if on_retry is not None:
+                                await on_retry(attempt + 1, "rate_limited")
                             await self._backoff(attempt)
                             continue
                         raise OpenRouterError("rate_limited", "The AI provider is rate limiting requests.")
                     if response.status_code >= 500:
                         if attempt < retries:
+                            if on_retry is not None:
+                                await on_retry(attempt + 1, "provider_error")
                             await self._backoff(attempt)
                             continue
                         raise OpenRouterError("provider_unavailable", "The AI provider is temporarily unavailable.")
@@ -190,12 +225,14 @@ class OpenRouterClient:
                             "tool_calls": tool_calls,
                             "model": parsed.get("model", model),
                             "usage": parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None,
+                            "citations": normalize_citations(parsed.get("citations")),
                         }
 
                     content_parts: list[str] = []
                     tool_call_deltas: dict[int, dict[str, Any]] = {}
                     reasoning_parts: list[Any] = []
                     usage: dict[str, Any] | None = None
+                    citations: list[dict[str, Any]] = []
                     response_model = model
                     pending_text: list[str] = []
                     last_text_delivery = time.monotonic()
@@ -233,6 +270,9 @@ class OpenRouterClient:
                         chunk_usage = chunk.get("usage")
                         if isinstance(chunk_usage, dict):
                             usage = chunk_usage
+                        chunk_citations = normalize_citations(chunk.get("citations"))
+                        if chunk_citations:
+                            citations = chunk_citations
                         choices = chunk.get("choices")
                         if not isinstance(choices, list) or not choices:
                             continue
@@ -293,16 +333,21 @@ class OpenRouterClient:
                         "tool_calls": tool_calls,
                         "model": response_model,
                         "usage": usage,
+                        "citations": citations,
                     }
             except OpenRouterError:
                 raise
             except httpx.TimeoutException:
                 if attempt < retries and not emitted_text:
+                    if on_retry is not None:
+                        await on_retry(attempt + 1, "timeout")
                     await self._backoff(attempt)
                     continue
                 raise OpenRouterError("timeout", "The AI provider took too long to respond.") from None
             except httpx.RequestError:
                 if attempt < retries and not emitted_text:
+                    if on_retry is not None:
+                        await on_retry(attempt + 1, "provider_unavailable")
                     await self._backoff(attempt)
                     continue
                 raise OpenRouterError(

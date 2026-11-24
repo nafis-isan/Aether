@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.ai.openrouter import OpenRouterClient
 from app.api.routes import chat as chat_route
 from app.config import settings
-from app.database.models import AgentCheckpoint, AgentEvent, AgentRun
+from app.database.models import AgentCheckpoint, AgentEvent, AgentRun, Artifact
 from app.main import app
 
 
@@ -121,6 +121,11 @@ async def test_multi_step_goal_is_planned_and_uses_previous_step_result(client, 
         assert tool_events[0].payload["input"] == {"expression": "2 + 3"}
         assert tool_events[1].payload["output"] == {"value": 5}
         assert "usage.updated" in event_types
+        assert "dag.created" in event_types
+        assert "subagent.started" in event_types
+        assert "subagent.completed" in event_types
+        artifacts = list(await session.scalars(select(Artifact).where(Artifact.agent_run_id == run.id)))
+        assert len(artifacts) == 2
 
 
 @pytest.mark.asyncio

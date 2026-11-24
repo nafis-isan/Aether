@@ -13,6 +13,7 @@ from app.api.routes.realtime import router as realtime_router
 from app.api.routes.tasks import router as tasks_router
 from app.api.routes.approvals import router as approvals_router
 from app.api.routes.browser import router as browser_router
+from app.api.routes.artifacts import router as artifacts_router
 from app.browser.manager import get_browser_manager
 from app.config import settings
 
@@ -68,6 +69,7 @@ app.include_router(memory_router)
 app.include_router(tasks_router)
 app.include_router(approvals_router)
 app.include_router(browser_router)
+app.include_router(artifacts_router)
 app.include_router(realtime_router)
 
 

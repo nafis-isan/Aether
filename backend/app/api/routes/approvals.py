@@ -173,7 +173,7 @@ async def decide_approval(
         run_id=run.id,
         agent_name=run.selected_agent,
         event_type="tool.completed",
-        payload={"tool": approval.tool_name, "status": "completed"},
+        payload={"tool": approval.tool_name, "status": "completed", "output": output},
     )
 
     continuation_messages = pending_state.get("continuation_messages")

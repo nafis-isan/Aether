@@ -50,3 +50,16 @@ async def update_task(
     await session.commit()
     await session.refresh(task)
     return task
+
+
+@router.delete("/{task_id}", status_code=204)
+async def delete_task(
+    task_id: str,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> None:
+    task = await session.scalar(select(Task).where(Task.id == task_id, Task.user_id == user.id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await session.delete(task)
+    await session.commit()

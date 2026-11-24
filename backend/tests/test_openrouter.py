@@ -62,6 +62,42 @@ async def test_rate_limit_retries_then_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_retry_callback_and_citations_are_exposed(monkeypatch):
+    attempts = 0
+    retries = []
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(settings, "openrouter_max_retries", 1)
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "Research answer"}}],
+                "citations": [{"title": "Example", "url": "https://example.com/source"}],
+            },
+        )
+
+    async def on_retry(attempt: int, reason: str) -> None:
+        retries.append((attempt, reason))
+
+    client = OpenRouterClient(transport=httpx.MockTransport(handler), sleep=no_wait)
+    result = await client.complete(
+        model="model",
+        messages=[{"role": "user", "content": "Hi"}],
+        on_retry=on_retry,
+    )
+    assert retries == [(1, "rate_limited")]
+    assert result["citations"] == [{"title": "Example", "url": "https://example.com/source", "snippet": None, "provider": None}]
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_provider_response_is_not_retried(monkeypatch):
     attempts = 0
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")

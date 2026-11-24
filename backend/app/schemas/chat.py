@@ -53,6 +53,7 @@ class ChatResponse(BaseModel):
     run_id: UUID | None = None
     selected_agent: str | None = None
     pending_approval_id: UUID | None = None
+    citations: list[dict] = Field(default_factory=list)
 
 
 class ConversationRead(BaseModel):
@@ -67,3 +68,4 @@ class MessageRead(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     created_at: datetime
+    metadata: dict | None = Field(default=None, validation_alias="metadata_json", serialization_alias="metadata")
