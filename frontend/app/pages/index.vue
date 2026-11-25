@@ -172,12 +172,18 @@ const latestAssistantCitations = computed(() => {
     : [];
 });
 const conversationHistory = computed(() => {
-  const latestAssistant = !busy.value
-    ? [...messages.value].reverse().find((message) => message.role === 'assistant')
-    : undefined;
-  return latestAssistant
-    ? messages.value.filter((message) => message.id !== latestAssistant.id)
-    : messages.value;
+  if (streamedReply.value) {
+    return [
+      ...messages.value,
+      {
+        id: 'streamed-assistant',
+        role: 'assistant' as const,
+        content: streamedReply.value,
+        created_at: new Date().toISOString()
+      }
+    ];
+  }
+  return messages.value;
 });
 const currentActivityEvents = computed(() => currentRunEvents.value.filter((event) =>
   event.type !== 'assistant.delta' && event.type !== 'usage.updated'
@@ -1173,7 +1179,30 @@ function speakReply(text: string): void {
     return;
   }
   window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
+  const spokenText = text
+    .replace(/```(?:\w+)?([\s\S]*?)```/g, ' $1 ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/\S+/gi, 'tautan')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/^[\s]*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+[.)]\s+/gm, '')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/[*_~>|]/g, ' ')
+    .replace(/[{}\[\]()<>]/g, ' ')
+    .replace(/[\r\n]+/g, '. ')
+    .replace(/[^\p{L}\p{N}\s.,!?;:'"%-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s([.,!?;])/g, '$1')
+    .trim();
+
+  if (!spokenText) {
+    voiceStatus.value = '';
+    return;
+  }
+
+  const utterance = new SpeechSynthesisUtterance(spokenText);
   utterance.lang = 'id-ID';
   utterance.onstart = () => {
     voiceStatus.value = 'Aether sedang berbicara…';
@@ -1219,6 +1248,27 @@ function startNewTask(): void {
   void nextTick(() => composerInput.value?.focus());
 }
 
+function openConversationSearch(): void {
+  activeSidebarSection.value = 'explore';
+  conversationSearch.value = '';
+  void nextTick(() => document.querySelector<HTMLInputElement>('.conversation-search input')?.focus());
+}
+
+function exportConversation(): void {
+  const title = conversations.value.find((item) => item.id === activeConversationId.value)?.title || 'Aether conversation';
+  const lines = conversationHistory.value.map((message) =>
+    `${message.role === 'assistant' ? 'Aether' : 'Kamu'}:\n${message.content}`
+  );
+  const content = [`${title}\n`, ...lines].join('\n\n');
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${title.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLocaleLowerCase() || 'aether-chat'}.txt`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 function dismissApprovalModal(): void {
   approvalModalId.value = null;
 }
@@ -1259,6 +1309,12 @@ watch(activeConversationId, () => {
   activityEvents.value = [];
   eventCursors.value = {};
   streamedReply.value = '';
+});
+watch(conversationHistory, () => {
+  void nextTick(() => {
+    const scrollContainer = document.querySelector<HTMLElement>('.chat-active .task-main');
+    if (scrollContainer) scrollContainer.scrollTop = scrollContainer.scrollHeight;
+  });
 });
 watch([token, activeConversationId, localAuthMode], connectActivity);
 onMounted(() => {
@@ -1366,7 +1422,7 @@ onBeforeUnmount(() => {
         @pointerdown.prevent="beginSidebarResize"
       ><span /></button>
 
-      <div class="workspace-main">
+      <div class="workspace-main" :class="{ 'chat-active': workspaceView === 'chat' && hasStartedTask }">
         <DashboardTopbar
           :agent-visual-label="agentVisualLabel"
           :agent-visual-status="agentVisualStatus"
@@ -1379,6 +1435,31 @@ onBeforeUnmount(() => {
         />
 
       <section v-if="workspaceView === 'chat'" class="chat-area">
+        <header v-if="hasStartedTask" class="chat-session-header">
+          <button type="button" class="chat-back-button" aria-label="Percakapan baru" title="Percakapan baru" @click="startNewTask">
+            <svg aria-hidden="true" viewBox="0 0 20 20">
+              <path d="m12.5 15-5-5 5-5" />
+            </svg>
+          </button>
+          <div class="chat-session-title">
+            <strong>{{ conversations.find((item) => item.id === activeConversationId)?.title || 'Percakapan Aether' }}</strong>
+            <span>{{ isWorkflowActive ? 'Aether sedang bekerja' : 'Disimpan lokal · baru saja' }}</span>
+          </div>
+          <div class="chat-session-actions">
+            <button type="button" aria-label="Cari percakapan" title="Cari percakapan" @click="openConversationSearch">
+              <svg aria-hidden="true" viewBox="0 0 20 20">
+                <circle cx="8.5" cy="8.5" r="5.5" />
+                <path d="m13 13 4 4" />
+              </svg>
+            </button>
+            <button type="button" class="chat-export-button" :disabled="conversationHistory.length === 0" @click="exportConversation">
+              <svg aria-hidden="true" viewBox="0 0 20 20">
+                <path d="M5 3.5h7l3 3v10H5zM12 3.5v3h3M8 10h5M8 13h5" />
+              </svg>
+              Ekspor
+            </button>
+          </div>
+        </header>
         <div class="task-workspace" :class="{ 'is-empty': !hasStartedTask }">
           <section class="task-main" aria-label="Task workspace">
             <div v-if="!hasStartedTask" class="task-landing-intro">
@@ -1391,6 +1472,30 @@ onBeforeUnmount(() => {
             </div>
 
             <section v-else class="task-timeline-pane" aria-labelledby="timeline-title" aria-live="polite" :aria-busy="busy">
+              <div v-if="conversationHistory.length" class="chat-message-thread" aria-label="Percakapan">
+                <article
+                  v-for="message in conversationHistory"
+                  :key="message.id"
+                  class="chat-message"
+                  :class="message.role"
+                >
+                  <header v-if="message.role === 'assistant'" class="chat-message-author">
+                    <span class="chat-author-mark" aria-hidden="true">
+                      <img src="/aether-monogram-mint.png" alt="" />
+                    </span>
+                    <div>
+                      <strong>Aether</strong>
+                      <small>{{ formatActivityTime(message.created_at) }}</small>
+                    </div>
+                    <button type="button" aria-label="Lebih banyak opsi">•••</button>
+                  </header>
+                  <div v-else class="chat-message-label">
+                    <span>YOU</span>
+                    <strong>Permintaanmu</strong>
+                  </div>
+                  <div class="chat-message-content message-markdown" v-html="renderMessageMarkdown(message.content)" />
+                </article>
+              </div>
               <header class="task-pane-heading">
                 <div>
                   <p class="eyebrow">RUN / {{ currentRunEvents[0]?.run_id.slice(0, 8) || 'PENDING' }}</p>
@@ -2609,7 +2714,7 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
   position: relative;
   grid-template-columns: var(--sidebar-width, 280px) minmax(0, 1fr);
   overflow: hidden;
-  background: var(--shell-paper);
+  background: #171a18;
 }
 .sidebar-resizer {
   position: absolute;
@@ -2724,12 +2829,13 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 
 .workspace-main {
   min-width: 0;
-  height: calc(100vh - 6px);
+  height: calc(100vh - 12px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  margin: 6px 6px 0 0;
-  border-radius: 24px 24px 0 0;
+  margin: 6px 6px 6px 0;
+  border: 1px solid rgba(215, 218, 209, 0.72);
+  border-radius: 24px;
   background: var(--shell-paper);
 }
 .workspace-topbar {
@@ -2742,7 +2848,7 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
   gap: 18px;
   padding: 0 clamp(22px, 3.2vw, 48px);
   border-bottom: 1px solid #dedfd8;
-  border-radius: 24px 24px 0 0;
+  border-radius: 23px 23px 0 0;
   background: #f6f6f0;
 }
 .workspace-context { min-width: 0; display: flex; align-items: center; gap: 10px; color: #737973; font-size: 14px; }
@@ -2963,6 +3069,292 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .pause-button { border-color: #d6bd80; background: #fcf8ed; color: #916c24; }
 .stop-button { border-color: #d8a2a2; background: #fff6f5; color: #b94d4d; }
 .voice-privacy, .voice-status { color: #858b85; }
+
+.workspace-main.chat-active > .workspace-topbar {
+  display: none;
+}
+
+.chat-active .chat-area {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0 clamp(16px, 2.8vw, 40px) 14px;
+}
+
+.chat-session-header {
+  height: 82px;
+  flex: 0 0 82px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid #dedfd8;
+  border-radius: 23px 23px 0 0;
+  background: var(--shell-paper);
+}
+
+.chat-back-button,
+.chat-session-actions button {
+  height: 38px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid #dedfd8;
+  border-radius: 10px;
+  background: #fbfbf7;
+  color: #5f665f;
+  cursor: pointer;
+}
+
+.chat-back-button {
+  width: 38px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.chat-back-button svg,
+.chat-session-actions svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chat-session-title {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.chat-session-title strong {
+  overflow: hidden;
+  color: #30352f;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-session-title span {
+  color: #69a58d;
+  font-size: 9px;
+}
+
+.chat-session-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-session-actions button {
+  width: 38px;
+}
+
+.chat-session-actions .chat-export-button {
+  width: auto;
+  grid-auto-flow: column;
+  grid-template-columns: 18px auto;
+  gap: 7px;
+  padding: 0 12px;
+  font-size: 11px;
+}
+
+.chat-session-actions button:hover,
+.chat-back-button:hover {
+  border-color: #b4cfc1;
+  background: #f8fcf9;
+  color: #337c60;
+}
+
+.chat-active .task-workspace:not(.is-empty) {
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.chat-active .task-workspace:not(.is-empty) .task-main {
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  background: var(--shell-paper);
+}
+
+.chat-active .task-timeline-pane {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 24px 14px 18px;
+}
+
+.chat-message-thread {
+  display: grid;
+  gap: 18px;
+}
+
+.chat-message {
+  min-width: 0;
+  max-width: 780px;
+  display: grid;
+  gap: 10px;
+}
+
+.chat-message.user {
+  justify-items: start;
+  margin-bottom: 2px;
+}
+
+.chat-message.assistant {
+  width: 100%;
+  max-width: none;
+  padding: 10px 0 4px;
+  border-top: 1px solid #e3e4de;
+}
+
+.chat-message-label {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: end;
+  column-gap: 8px;
+  color: #777e78;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+}
+
+.chat-message-label span {
+  grid-row: 1 / 3;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #dcded7;
+  border-radius: 50%;
+  background: #fbfbf7;
+  color: #6c746d;
+  letter-spacing: 0;
+}
+
+.chat-message-label strong {
+  color: #343934;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 27px;
+  letter-spacing: -0.035em;
+}
+
+.chat-message-author {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 2px;
+}
+
+.chat-author-mark {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #171d1a;
+}
+
+.chat-author-mark img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+}
+
+.chat-message-author div {
+  display: grid;
+  gap: 2px;
+}
+
+.chat-message-author strong {
+  color: #303630;
+  font-size: 12px;
+}
+
+.chat-message-author small {
+  color: #8a9089;
+  font-size: 9px;
+}
+
+.chat-message-author button {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  color: #90968f;
+  cursor: default;
+  letter-spacing: 2px;
+}
+
+.chat-message-content {
+  color: #454b45;
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+.chat-message.assistant .chat-message-content {
+  padding: 2px 2px 12px 47px;
+  color: #303630;
+  font-size: 14px;
+}
+
+.chat-active .task-timeline-pane > .task-pane-heading,
+.chat-active .task-timeline-pane > .run-summary,
+.chat-active .task-timeline-pane > .tool-activity,
+.chat-active .task-timeline-pane > .dag-view,
+.chat-active .task-timeline-pane > .task-event-log,
+.chat-active .task-timeline-pane > .timeline-empty,
+.chat-active .task-timeline-pane > .timeline-workers,
+.chat-active .task-timeline-pane > .process-summary,
+.chat-active .task-timeline-pane > .run-controls {
+  display: none;
+}
+
+.chat-active .artifact-pane {
+  min-height: 0;
+  display: none;
+}
+
+.chat-active .composer-wrap {
+  position: sticky;
+  z-index: 8;
+  bottom: 0;
+  width: 100%;
+  max-width: 920px;
+  align-self: center;
+  margin-top: auto;
+  padding: 12px 14px 8px;
+  background: linear-gradient(180deg, rgba(242, 242, 236, 0), var(--shell-paper) 22%);
+}
+
+.chat-active .task-composer {
+  min-height: 118px;
+}
+
+@media (max-width: 760px) {
+  .workspace-main {
+    height: auto;
+    min-height: calc(100vh - 38vh - 12px);
+    margin: 6px;
+    border-radius: 19px;
+  }
+  .chat-active .chat-area { padding: 0 10px 8px; }
+  .chat-session-header { height: 68px; flex-basis: 68px; grid-template-columns: 38px minmax(0, 1fr) auto; }
+  .chat-session-actions button:not(.chat-export-button) { display: none; }
+  .chat-session-actions .chat-export-button { width: 38px; padding: 0; grid-template-columns: 18px; font-size: 0; }
+  .chat-active .task-workspace:not(.is-empty) { display: block; overflow-y: auto; }
+  .chat-active .task-workspace:not(.is-empty) .task-main { min-height: 100%; overflow: visible; }
+  .chat-active .artifact-pane { display: none; }
+  .chat-active .composer-wrap { position: sticky; padding: 8px 4px 4px; }
+  .chat-active .task-composer { min-height: 104px; border-radius: 20px; }
+}
 .capabilities-panel { width: min(1280px, 100%); padding: 24px 0 0; box-sizing: border-box; }
 .capabilities-heading { justify-content: flex-start; margin: 0 0 13px; }
 .capabilities-heading h2 { margin: 0; }
