@@ -1,107 +1,23 @@
 <script setup lang="ts">
 import MarkdownIt from 'markdown-it';
 import taskLists from 'markdown-it-task-lists';
-
-type User = {
-  id: string;
-  email: string;
-  name: string;
-};
-
-type Conversation = {
-  id: string;
-  title: string;
-  updated_at: string;
-};
-
-type ChatMessage = {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  created_at: string;
-  pending?: boolean;
-  metadata?: Record<string, unknown> | null;
-};
-
-type AuthResponse = {
-  access_token: string;
-  user: User;
-};
-
-type ChatResponse = {
-  conversation_id: string;
-  reply: string;
-  model: string;
-  pending_approval_id?: string | null;
-  citations?: Array<{ title?: string; url: string; snippet?: string | null; provider?: string | null }>;
-};
-
-type ActivityEvent = {
-  event_id: string;
-  sequence: number;
-  type: string;
-  run_id: string;
-  created_at: string;
-  data: Record<string, unknown>;
-};
-
-type PlanProgress = {
-  index: number;
-  description: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'stopped' | 'paused';
-};
-
-type UsageTotals = {
-  prompt_tokens?: number;
-  completion_tokens?: number;
-  total_tokens?: number;
-  cost?: number;
-};
-
-type AgentDefinition = {
-  name: string;
-  description: string;
-};
-
-type AgentActivity = {
-  id: string;
-  name: string;
-  description: string;
-  status: 'idle' | 'thinking' | 'working' | 'approval' | 'completed' | 'error';
-  isRouted?: boolean;
-};
-
-type Approval = {
-  id: string;
-  tool_name: string;
-  tool_arguments: Record<string, unknown>;
-};
-
-type Memory = {
-  id: string;
-  memory_type: 'preference' | 'fact' | 'context';
-  content: string;
-  importance: number;
-  is_active: boolean;
-  created_at: string;
-  updated_at: string;
-};
-
-type Artifact = {
-  id: string;
-  conversation_id: string;
-  agent_run_id?: string | null;
-  title: string;
-  kind: string;
-  mime_type: string;
-  content: string;
-  metadata: Record<string, unknown>;
-  created_at: string;
-};
-
-type WorkspaceView = 'chat' | 'memory';
-
-type AgentVisualStatus = 'idle' | 'thinking' | 'executing' | 'approval' | 'error';
+import type {
+  ActivityEvent,
+  AgentActivity,
+  AgentDefinition,
+  AgentVisualStatus,
+  Approval,
+  Artifact,
+  AuthResponse,
+  ChatMessage,
+  ChatResponse,
+  Conversation,
+  Memory,
+  PlanProgress,
+  UsageTotals,
+  User,
+  WorkspaceView
+} from '../types/aether';
 
 type SpeechRecognitionResultLike = {
   isFinal: boolean;
@@ -137,7 +53,6 @@ const user = ref<User | null>(null);
 const workspaceView = ref<WorkspaceView>('chat');
 const activeSidebarSection = ref<'home' | 'explore' | 'collection'>('home');
 const conversationSearch = ref('');
-const conversationSearchInput = ref<HTMLInputElement | null>(null);
 const sidebarWidth = ref(280);
 const sidebarResizing = ref(false);
 const localAuthMode = ref(false);
@@ -150,6 +65,10 @@ const conversations = ref<Conversation[]>([]);
 const messages = ref<ChatMessage[]>([]);
 const activeConversationId = ref<string | null>(null);
 const draft = ref('');
+const attachmentInput = ref<HTMLInputElement | null>(null);
+const selectedAttachment = ref<File | null>(null);
+const attachmentText = ref('');
+const isReadingAttachment = ref(false);
 const modelRole = ref<'general' | 'coding'>('general');
 const busy = ref(false);
 const isStoppingRun = ref(false);
@@ -909,7 +828,7 @@ async function openExplore(): Promise<void> {
   activeSidebarSection.value = 'explore';
   workspaceView.value = 'chat';
   await nextTick();
-  conversationSearchInput.value?.focus();
+  document.querySelector<HTMLInputElement>('.conversation-search input')?.focus();
 }
 
 function openCollection(): void {
@@ -939,9 +858,84 @@ function endSidebarResize(): void {
   localStorage.setItem('aether-sidebar-width', String(sidebarWidth.value));
 }
 
+function openAttachmentPicker(): void {
+  attachmentInput.value?.click();
+}
+
+async function extractAttachmentText(file: File): Promise<string> {
+  const extension = file.name.split('.').pop()?.toLocaleLowerCase() || '';
+  const textExtensions = new Set(['txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'html', 'htm', 'js', 'ts', 'vue', 'css', 'scss', 'py', 'sql', 'log']);
+
+  if (textExtensions.has(extension) || file.type.startsWith('text/')) {
+    return file.text();
+  }
+
+  if (extension === 'pdf' || file.type === 'application/pdf') {
+    const pdfjs = await import('pdfjs-dist');
+    pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+    const document = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+    const pages: string[] = [];
+    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const textContent = await page.getTextContent();
+      pages.push(textContent.items.map((item) => ('str' in item ? item.str : '')).join(' ').trim());
+    }
+    return pages.filter(Boolean).join('\n\n');
+  }
+
+  if (extension === 'docx' || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    const mammoth = await import('mammoth');
+    const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+    return result.value;
+  }
+
+  throw new Error(`Format .${extension || 'file'} belum didukung. Gunakan PDF, DOCX, TXT, atau dokumen teks.`);
+}
+
+async function handleAttachmentChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  if (file.size > 10 * 1024 * 1024) {
+    errorMessage.value = 'Dokumen maksimal berukuran 10 MB.';
+    input.value = '';
+    return;
+  }
+
+  selectedAttachment.value = file;
+  attachmentText.value = '';
+  errorMessage.value = '';
+  isReadingAttachment.value = true;
+  try {
+    attachmentText.value = await extractAttachmentText(file);
+  } catch (error) {
+    selectedAttachment.value = null;
+    errorMessage.value = getErrorMessage(error);
+  } finally {
+    isReadingAttachment.value = false;
+  }
+}
+
+function removeAttachment(): void {
+  selectedAttachment.value = null;
+  attachmentText.value = '';
+  if (attachmentInput.value) attachmentInput.value.value = '';
+}
+
 async function sendMessage(): Promise<void> {
-  const message = draft.value.trim();
-  if (!message) return;
+  const draftMessage = draft.value.trim();
+  if (!draftMessage && !selectedAttachment.value) return;
+  if (isReadingAttachment.value) return;
+  const message = selectedAttachment.value
+    ? [
+        draftMessage || `Tinjau dokumen ${selectedAttachment.value.name}.`,
+        '',
+        `[Lampiran: ${selectedAttachment.value.name}]`,
+        attachmentText.value.trim()
+          ? `--- Isi dokumen ---\n${attachmentText.value.slice(0, 100_000)}`
+          : 'Dokumen tidak dapat dibaca sebagai teks.'
+      ].join('\n')
+    : draftMessage;
   if (isWorkflowPaused.value || (busy.value && isWorkflowActive.value)) {
     await redirectCurrentRun(message);
     return;
@@ -959,6 +953,23 @@ async function sendMessage(): Promise<void> {
       });
       activeConversationId.value = conversation.id;
     }
+    if (selectedAttachment.value) {
+      await $fetch(`${apiBase}/artifacts`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: {
+          conversation_id: activeConversationId.value,
+          title: selectedAttachment.value.name,
+          kind: 'document',
+          mime_type: selectedAttachment.value.type || 'application/octet-stream',
+          content: attachmentText.value,
+          metadata: {
+            size: selectedAttachment.value.size,
+            source: 'chat_attachment'
+          }
+        }
+      });
+    }
     streamedReply.value = '';
     const response = await $fetch<ChatResponse>(`${apiBase}/chat`, {
       method: 'POST',
@@ -975,6 +986,7 @@ async function sendMessage(): Promise<void> {
     pendingMessage.value = '';
     activeConversationId.value = response.conversation_id;
     draft.value = '';
+    removeAttachment();
     await Promise.all([
       loadConversations(),
       openConversation(response.conversation_id),
@@ -1048,6 +1060,7 @@ async function redirectCurrentRun(message: string): Promise<void> {
       body: { message }
     });
     draft.value = '';
+    removeAttachment();
     pendingMessage.value = '';
     activeConversationId.value = response.conversation_id;
     await Promise.all([
@@ -1270,24 +1283,17 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="app-shell">
-    <header v-if="!authModeLoaded || (!localAuthMode && !token)" class="topbar standalone-topbar">
-      <a class="brand" href="/" aria-label="Aether — beranda" :title="agentVisualLabel">
-        <span class="brand-mark" :class="agentVisualStatus" aria-hidden="true">
-          <img src="/aether-monogram.png" alt="" />
-          <span v-if="agentVisualStatus === 'approval'" class="brand-approval-dot" />
-        </span>
-        <span class="brand-name">Aether</span>
-      </a>
-      <div class="topbar-right">
-        <span class="backend-indicator" :class="backendStatus">
-          <span class="indicator-dot" />
-          {{ backendStatus === 'connected' ? 'Backend tersambung' : backendStatus === 'checking' ? 'Memeriksa backend' : 'Backend tidak tersedia' }}
-        </span>
-        <span v-if="backendHealthError" class="backend-error" :title="backendHealthError">{{ backendHealthError }}</span>
-        <span v-if="user" class="user-label">{{ localAuthMode ? 'Mode lokal' : user.name }}</span>
-        <button v-if="user && !localAuthMode" class="sign-out" type="button" @click="signOut">Keluar</button>
-      </div>
-    </header>
+    <DashboardTopbar
+      v-if="!authModeLoaded || (!localAuthMode && !token)"
+      standalone
+      :agent-visual-label="agentVisualLabel"
+      :agent-visual-status="agentVisualStatus"
+      :backend-status="backendStatus"
+      :backend-health-error="backendHealthError"
+      :local-auth-mode="localAuthMode"
+      :user="user"
+      @sign-out="signOut"
+    />
 
     <section v-if="!authModeLoaded" class="startup-state">
       <span class="spark">✳</span>
@@ -1331,98 +1337,27 @@ onBeforeUnmount(() => {
     </section>
 
     <section v-else class="workspace" :style="{ '--sidebar-width': `${sidebarWidth}px` }" :class="{ 'sidebar-resizing': sidebarResizing }">
-      <aside class="sidebar">
-        <a class="brand sidebar-brand" href="/" aria-label="Aether — beranda" :title="agentVisualLabel">
-          <span class="brand-mark" :class="agentVisualStatus" aria-hidden="true">
-            <img src="/aether-monogram.png" alt="" />
-            <span v-if="agentVisualStatus === 'approval'" class="brand-approval-dot" />
-          </span>
-          <span class="brand-name">ÆTHER</span>
-        </a>
-        <button class="new-chat" type="button" :disabled="busy" @click="startNewTask">
-          <span aria-hidden="true">＋</span> Percakapan baru
-        </button>
-        <nav class="workspace-nav" aria-label="Workspace">
-          <button
-            type="button"
-            :class="{ selected: activeSidebarSection === 'home' }"
-            @click="openHome"
-          >
-            <svg aria-hidden="true" viewBox="0 0 20 20">
-              <path d="m3 9 7-6 7 6M5 8v9h10V8M8 17v-5h4v5" />
-            </svg>
-            Beranda
-          </button>
-          <button
-            type="button"
-            :class="{ selected: activeSidebarSection === 'explore' }"
-            @click="openExplore"
-          >
-            <svg aria-hidden="true" viewBox="0 0 20 20">
-              <circle cx="8.5" cy="8.5" r="5.5" />
-              <path d="m13 13 4 4" />
-            </svg>
-            Jelajahi
-          </button>
-          <button
-            type="button"
-            :class="{ selected: activeSidebarSection === 'collection' }"
-            @click="openCollection"
-          >
-            <svg aria-hidden="true" viewBox="0 0 20 20">
-              <path d="M2.5 5.5h6l1.5 2h7.5v9h-15zM2.5 7.5v-2a1.5 1.5 0 0 1 1.5-1.5h3l1.5 1.5" />
-            </svg>
-            Koleksi
-            <span class="nav-count">{{ activeMemoryCount }}</span>
-          </button>
-        </nav>
-
-        <template v-if="workspaceView === 'chat'">
-          <p class="sidebar-heading">TERBARU</p>
-          <label v-if="activeSidebarSection === 'explore' || conversationSearch" class="conversation-search">
-            <span class="visually-hidden">Cari percakapan</span>
-            <input ref="conversationSearchInput" v-model="conversationSearch" type="search" placeholder="Cari percakapan…" />
-          </label>
-          <button
-            v-for="conversation in visibleConversations"
-            :key="conversation.id"
-            class="conversation-item"
-            :class="{ selected: activeConversationId === conversation.id }"
-            type="button"
-            @click="openConversation(conversation.id)"
-          >
-            <span class="conversation-icon" aria-hidden="true" />
-            <span>{{ conversation.title }}</span>
-          </button>
-          <p v-if="conversations.length === 0" class="empty-history">Belum ada percakapan.</p>
-          <p v-else-if="visibleConversations.length === 0" class="empty-history">Tidak ada percakapan yang cocok.</p>
-
-          <section v-if="approvals.length" class="sidebar-approvals" aria-label="Persetujuan">
-            <div class="sidebar-section-heading approval-heading has-approvals">
-              <p class="sidebar-heading">PERSETUJUAN</p>
-              <span class="approval-count">{{ approvals.length }}</span>
-            </div>
-            <article v-for="approval in approvals" :key="approval.id" class="sidebar-card approval-card">
-              <p>{{ approval.tool_name === 'create_task' ? 'Buat tugas' : approval.tool_name }}</p>
-              <span>{{ approval.tool_arguments.title || 'Tindakan memerlukan persetujuanmu.' }}</span>
-              <div class="approval-actions">
-                <button type="button" :disabled="busy" @click="decideApproval(approval, true)">Setujui</button>
-                <button type="button" :disabled="busy" @click="decideApproval(approval, false)">Tolak</button>
-              </div>
-            </article>
-          </section>
-        </template>
-
-        <div class="sidebar-footer">
-          <div class="sidebar-profile">
-            <span class="sidebar-avatar" aria-hidden="true"><img src="/aether-monogram.png" alt="" /></span>
-            <span class="sidebar-profile-copy">
-              <strong>{{ user?.name || 'Aether' }}</strong>
-              <small>{{ localAuthMode ? 'Workspace lokal' : user?.email || 'Personal workspace' }}</small>
-            </span>
-          </div>
-        </div>
-      </aside>
+      <DashboardSidebar
+        v-model:conversation-search="conversationSearch"
+        :active-sidebar-section="activeSidebarSection"
+        :active-conversation-id="activeConversationId"
+        :active-memory-count="activeMemoryCount"
+        :agent-visual-label="agentVisualLabel"
+        :agent-visual-status="agentVisualStatus"
+        :approvals="approvals"
+        :busy="busy"
+        :conversations="conversations"
+        :local-auth-mode="localAuthMode"
+        :user="user"
+        :visible-conversations="visibleConversations"
+        :workspace-view="workspaceView"
+        @start-new-task="startNewTask"
+        @open-home="openHome"
+        @open-explore="openExplore"
+        @open-collection="openCollection"
+        @open-conversation="openConversation"
+        @decide-approval="decideApproval"
+      />
       <button
         class="sidebar-resizer"
         type="button"
@@ -1432,27 +1367,24 @@ onBeforeUnmount(() => {
       ><span /></button>
 
       <div class="workspace-main">
-        <header class="workspace-topbar">
-          <div class="workspace-context">
-            <span>Aether</span>
-            <span class="context-divider" aria-hidden="true">/</span>
-            <strong>{{ workspaceContext }}</strong>
-          </div>
-          <div class="topbar-right">
-            <span class="backend-indicator" :class="backendStatus">
-              <span class="indicator-dot" />
-              {{ backendStatus === 'connected' ? 'Backend tersambung' : backendStatus === 'checking' ? 'Memeriksa backend' : 'Backend tidak tersedia' }}
-            </span>
-            <span v-if="backendHealthError" class="backend-error" :title="backendHealthError">{{ backendHealthError }}</span>
-            <span v-if="user" class="user-label">{{ localAuthMode ? 'Mode lokal' : user.name }}</span>
-            <button v-if="user && !localAuthMode" class="sign-out" type="button" @click="signOut">Keluar</button>
-          </div>
-        </header>
+        <DashboardTopbar
+          :agent-visual-label="agentVisualLabel"
+          :agent-visual-status="agentVisualStatus"
+          :backend-status="backendStatus"
+          :backend-health-error="backendHealthError"
+          :local-auth-mode="localAuthMode"
+          :user="user"
+          :workspace-context="workspaceContext"
+          @sign-out="signOut"
+        />
 
       <section v-if="workspaceView === 'chat'" class="chat-area">
         <div class="task-workspace" :class="{ 'is-empty': !hasStartedTask }">
           <section class="task-main" aria-label="Task workspace">
             <div v-if="!hasStartedTask" class="task-landing-intro">
+              <span class="landing-logo" aria-label="Aether">
+                <img src="/aether-monogram-mint.png" alt="" />
+              </span>
               <p class="eyebrow">PERSONAL AI WORKSPACE</p>
               <h2>Selamat datang,<br /><span>apa yang ingin kamu buat?</span></h2>
               <p>Berpikir, merencanakan, dan berkarya lebih jernih bersama ruang kerja yang memahami caramu bekerja.</p>
@@ -1578,6 +1510,13 @@ onBeforeUnmount(() => {
             <div class="composer-wrap" :class="{ 'goal-composer-wrap': !hasStartedTask }">
               <p v-if="errorMessage" class="error-message chat-error" role="alert">{{ errorMessage }}</p>
               <form class="composer task-composer" @submit.prevent="sendMessage">
+                <input
+                  ref="attachmentInput"
+                  class="visually-hidden"
+                  type="file"
+                  accept=".pdf,.docx,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.js,.ts,.vue,.css,.py,.sql,.log,text/plain,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  @change="handleAttachmentChange"
+                />
                 <label class="visually-hidden" for="task-goal">Tujuan task untuk Aether</label>
                 <textarea
                   id="task-goal"
@@ -1589,8 +1528,43 @@ onBeforeUnmount(() => {
                   :placeholder="isWorkflowActive || isWorkflowPaused ? '> Tulis perubahan tujuan untuk mengalihkan run…' : '> Apa yang ingin Aether selesaikan?'"
                   @keydown.enter.exact.prevent="sendMessage"
                 />
+                <div v-if="selectedAttachment" class="attachment-chip" :class="{ reading: isReadingAttachment }">
+                  <span class="attachment-chip-icon" aria-hidden="true">◆</span>
+                  <span>
+                    <strong>{{ selectedAttachment.name }}</strong>
+                    <small>{{ isReadingAttachment ? 'Membaca dokumen…' : `${(selectedAttachment.size / 1024).toFixed(selectedAttachment.size < 1024 * 1024 ? 0 : 1)} KB` }}</small>
+                  </span>
+                  <button type="button" aria-label="Hapus lampiran" @click="removeAttachment">×</button>
+                </div>
                 <div class="composer-footer">
-                  <span>{{ isWorkflowActive ? 'Run aktif · instruksi berikutnya akan mengalihkan tujuan.' : 'Satu tujuan yang jelas membantu Aether bekerja lebih terarah.' }}</span>
+                  <div class="composer-left-tools">
+                    <button
+                      class="attachment-button"
+                      type="button"
+                      aria-label="Lampirkan berkas"
+                      title="Lampirkan dokumen"
+                      :disabled="busy || isReadingAttachment"
+                      @click="openAttachmentPicker"
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 20 20">
+                        <path d="M7.2 11.8 13 6a2.6 2.6 0 0 1 3.7 3.7l-7.1 7.1a4.2 4.2 0 0 1-6-6l7.6-7.6" />
+                      </svg>
+                    </button>
+                    <button
+                      class="voice-button"
+                      :class="{ listening: isListening }"
+                      type="button"
+                      :disabled="busy || !speechRecognitionAvailable"
+                      :aria-label="isListening ? 'Selesai merekam suara' : 'Mulai input suara'"
+                      :title="speechRecognitionAvailable ? (isListening ? 'Selesai bicara' : 'Bicara ke Aether') : 'Input suara tidak didukung browser ini'"
+                      @click="startVoiceInput"
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 20 20">
+                        <rect x="7" y="2.5" width="6" height="10" rx="3" />
+                        <path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5M7.5 17.5h5" />
+                      </svg>
+                    </button>
+                  </div>
                   <div class="composer-actions">
                     <label class="inline-model-select">
                       <span class="visually-hidden">Pilih model · {{ modelDetails.provider }}</span>
@@ -1607,22 +1581,13 @@ onBeforeUnmount(() => {
                       :title="speechSynthesisAvailable ? (speakReplies ? 'Matikan balasan suara' : 'Aktifkan balasan suara') : 'Balasan suara tidak didukung browser ini'"
                       @click="toggleSpokenReplies"
                     >{{ speakReplies ? 'Suara aktif' : 'Suara mati' }}</button>
-                    <button
-                      class="voice-button"
-                      :class="{ listening: isListening }"
-                      type="button"
-                      :disabled="busy || !speechRecognitionAvailable"
-                      :aria-label="isListening ? 'Selesai merekam suara' : 'Mulai input suara'"
-                      :title="speechRecognitionAvailable ? (isListening ? 'Selesai bicara' : 'Bicara ke Aether') : 'Input suara tidak didukung browser ini'"
-                      @click="startVoiceInput"
-                    >{{ isListening ? 'Selesai ■' : 'Mikrofon' }}</button>
                     <button v-if="busy && isWorkflowActive" class="pause-button" type="button" :disabled="isPausingRun" @click="pauseCurrentRun">
                       {{ isPausingRun ? 'Menjeda…' : 'Jeda' }}
                     </button>
                     <button v-if="busy && isWorkflowActive" class="stop-button" type="button" :disabled="isStoppingRun" @click="stopCurrentRun">
                       {{ isStoppingRun ? 'Menghentikan…' : 'Hentikan' }}
                     </button>
-                    <button class="send-button" type="submit" :disabled="!draft.trim() || (busy && !isWorkflowActive)" :aria-label="hasStartedTask ? 'Jalankan instruksi' : 'Jalankan task'">
+                    <button class="send-button" type="submit" :disabled="(!draft.trim() && !selectedAttachment) || isReadingAttachment || (busy && !isWorkflowActive)" :aria-label="hasStartedTask ? 'Jalankan instruksi' : 'Jalankan task'">
                       {{ isRedirectingRun ? 'Mengalihkan…' : isWorkflowActive || isWorkflowPaused ? 'Alihkan tujuan' : busy ? 'Menjalankan…' : 'Jalankan ↗' }}
                     </button>
                   </div>
@@ -1762,109 +1727,24 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
-      <section v-else class="memory-workspace" aria-labelledby="memory-title">
-        <header class="memory-header">
-          <div>
-            <p class="eyebrow">PERSONAL CONTEXT</p>
-            <h1 id="memory-title">Memory</h1>
-            <p>Hal yang kamu simpan dapat membantu Aether memberi jawaban yang lebih relevan.</p>
-          </div>
-          <div class="memory-counts" aria-label="Ringkasan memory">
-            <span><strong>{{ activeMemoryCount }}</strong> aktif</span>
-            <span><strong>{{ archivedMemoryCount }}</strong> diarsipkan</span>
-          </div>
-        </header>
-        <div class="memory-layout">
-          <form class="memory-editor" @submit.prevent="saveMemory">
-            <div>
-              <p class="eyebrow">TAMBAHKAN MEMORY</p>
-              <h2>Simpan konteks penting</h2>
-              <p>Memory hanya disimpan atas tindakanmu dan dapat dinonaktifkan kapan saja.</p>
-            </div>
-            <label class="memory-field">
-              Kategori
-              <select v-model="memoryType">
-                <option value="preference">Preferensi</option>
-                <option value="fact">Fakta</option>
-                <option value="context">Konteks</option>
-              </select>
-            </label>
-            <label class="memory-field">
-              Isi
-              <textarea v-model="memoryContent" maxlength="2000" rows="5" required placeholder="Contoh: Saya lebih suka penjelasan ringkas dengan contoh praktis." />
-            </label>
-            <label class="memory-field">
-              Kepentingan
-              <select v-model.number="memoryImportance">
-                <option :value="1">Rendah</option>
-                <option :value="2">Agak rendah</option>
-                <option :value="3">Normal</option>
-                <option :value="4">Penting</option>
-                <option :value="5">Sangat penting</option>
-              </select>
-            </label>
-            <button class="primary-button memory-save" type="submit" :disabled="busy || !memoryContent.trim()">
-              {{ busy ? 'Menyimpan…' : 'Simpan memory' }}
-            </button>
-          </form>
-
-          <div class="memory-library">
-            <div class="memory-library-heading">
-              <div>
-                <p class="eyebrow">MEMORY TERSIMPAN</p>
-                <h2>{{ showArchivedMemories ? 'Semua status' : 'Memory aktif' }}</h2>
-              </div>
-              <label class="archive-toggle">
-                <input v-model="showArchivedMemories" type="checkbox" />
-                Tampilkan arsip
-              </label>
-            </div>
-            <div class="memory-filters">
-              <label class="memory-search">
-                <span class="visually-hidden">Cari memory</span>
-                <input v-model="memorySearch" type="search" placeholder="Cari isi memory…" />
-              </label>
-              <label class="memory-category-filter">
-                <span class="visually-hidden">Filter kategori memory</span>
-                <select v-model="memoryCategoryFilter">
-                  <option value="all">Semua kategori</option>
-                  <option value="preference">Preferensi</option>
-                  <option value="fact">Fakta</option>
-                  <option value="context">Konteks</option>
-                </select>
-              </label>
-            </div>
-            <p v-if="errorMessage" class="error-message memory-error" role="alert">{{ errorMessage }}</p>
-            <p v-if="memories.length === 0" class="memory-empty">Belum ada memory. Simpan konteks pertama yang ingin Aether ingat.</p>
-            <p v-else-if="visibleMemories.length === 0" class="memory-empty">Tidak ada memory yang cocok dengan filter ini.</p>
-            <ul v-else class="memory-list">
-              <li v-for="memory in visibleMemories" :key="memory.id" class="memory-card">
-                <div class="memory-card-meta">
-                  <span class="memory-category">{{ { preference: 'Preferensi', fact: 'Fakta', context: 'Konteks' }[memory.memory_type] }}</span>
-                  <span class="memory-status" :class="{ archived: !memory.is_active }">{{ memory.is_active ? 'Aktif' : 'Diarsipkan' }}</span>
-                </div>
-                <p>{{ memory.content }}</p>
-                <div class="memory-card-footer">
-                  <span>Kepentingan {{ memory.importance }}/5</span>
-                  <time v-if="memory.updated_at && formatMemoryDate(memory.updated_at)" :datetime="memory.updated_at">
-                    Diperbarui {{ formatMemoryDate(memory.updated_at) }}
-                  </time>
-                  <div>
-                    <button
-                      type="button"
-                      :disabled="busy"
-                      @click="setMemoryActive(memory, !memory.is_active)"
-                    >
-                      {{ memory.is_active ? 'Arsipkan' : 'Aktifkan' }}
-                    </button>
-                    <button type="button" class="delete-memory" :disabled="busy" @click="deleteMemory(memory)">Hapus</button>
-                  </div>
-                </div>
-              </li>
-            </ul>
-          </div>
-        </div>
-      </section>
+      <MemoryWorkspace
+        v-if="workspaceView === 'memory'"
+        v-model:memory-content="memoryContent"
+        v-model:memory-type="memoryType"
+        v-model:memory-importance="memoryImportance"
+        v-model:memory-search="memorySearch"
+        v-model:memory-category-filter="memoryCategoryFilter"
+        v-model:show-archived-memories="showArchivedMemories"
+        :active-memory-count="activeMemoryCount"
+        :archived-memory-count="archivedMemoryCount"
+        :busy="busy"
+        :error-message="errorMessage"
+        :memories="memories"
+        :visible-memories="visibleMemories"
+        @save-memory="saveMemory"
+        @set-memory-active="setMemoryActive"
+        @delete-memory="deleteMemory"
+      />
 
       <div v-if="currentApprovalModal" class="approval-overlay" role="presentation" @click.self="dismissApprovalModal">
         <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-dialog-title">
@@ -2880,7 +2760,28 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .task-main { align-items: center; }
 .task-main > * { box-sizing: border-box; }
 .task-landing-intro { width: min(1280px, 100%); flex: 1 0 auto; min-height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: center; align-self: center; padding: 52px 0 28px; text-align: center; }
-.task-landing-intro .eyebrow { margin-bottom: 18px; color: #479f82; font-family: inherit; font-size: 11px; letter-spacing: 0.18em; }
+.landing-logo {
+  position: relative;
+  display: block;
+  width: 108px;
+  height: 108px;
+  margin: 0 0 14px;
+  overflow: visible;
+  border-radius: 0;
+}
+.landing-logo img { width: 100%; height: 100%; display: block; border-radius: 0; }
+.landing-logo::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #f5f7f4;
+  border-radius: 50%;
+  background: #69d3b8;
+}
+.task-landing-intro .eyebrow { margin-bottom: 18px; color: #69d3b8; font-family: inherit; font-size: 11px; letter-spacing: 0.18em; }
 .task-landing-intro h2 {
   margin: 0;
   color: #1d211e;
@@ -2939,10 +2840,21 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .composer-wrap { background: linear-gradient(180deg, #f2f2ec00 0%, #f2f2ec 18%); }
 .goal-composer-wrap { width: min(1280px, 100%) !important; justify-self: center; align-self: center; padding: 0 !important; }
 .task-composer { box-sizing: border-box; }
-.task-composer { border-color: #d7dad2; border-radius: 11px; background: #fbfbf7; box-shadow: 0 8px 26px #30352d0b; }
+.task-composer {
+  min-height: 142px;
+  border-color: #d7dad2;
+  border-radius: 25px;
+  background: #fbfbf7;
+  box-shadow: 0 8px 26px #30352d0b;
+  padding: 18px 18px 12px;
+}
 .task-composer:focus-within { border-color: #77c9a9; }
-.task-composer textarea { color: #303630; }
-.task-composer textarea::placeholder { color: #888f88; }
+.task-composer textarea {
+  min-height: 58px !important;
+  color: #303630;
+  font-size: 14px;
+}
+.task-composer textarea::placeholder { color: #a0a69f; font-size: 14px; }
 .composer-footer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -2950,13 +2862,104 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
   gap: 12px;
   color: #868c86;
 }
-.composer-footer > span { min-width: 0; }
+.composer-footer > span { display: none; }
+.composer-left-tools { display: flex; align-items: center; gap: 6px; }
+.attachment-button,
+.composer-left-tools .voice-button {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #727972;
+  transition: background-color 180ms ease, color 180ms ease, transform 180ms ease;
+}
+.attachment-button svg,
+.composer-left-tools .voice-button svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.attachment-button:disabled { opacity: 0.75; cursor: not-allowed; }
+.composer-left-tools .voice-button:not(:disabled):hover,
+.composer-left-tools .voice-button.listening {
+  background: #e7f5ef;
+  color: #368b6e;
+  transform: translateY(-1px);
+}
+.attachment-chip {
+  max-width: 260px;
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+  padding: 7px 8px;
+  border: 1px solid #b9d7c9;
+  border-radius: 12px;
+  background: #edf7f2;
+}
+.attachment-chip.reading { border-style: dashed; }
+.attachment-chip-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #69d3b8;
+  color: #fff;
+  font-size: 10px;
+}
+.attachment-chip > span:nth-child(2) { min-width: 0; display: grid; gap: 2px; }
+.attachment-chip strong { overflow: hidden; color: #3d4942; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-chip small { color: #7b887f; font-size: 8px; }
+.attachment-chip button {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #718078;
+  cursor: pointer;
+}
+.attachment-chip button:hover { background: #dcece4; color: #3d644f; }
 .composer-actions { min-width: 0; justify-content: flex-end; }
 .inline-model-select select, .voice-toggle, .voice-button { border-color: #d8dbd4; background: #f7f7f2; color: #555d56; }
+.inline-model-select select {
+  max-width: 178px;
+  height: 34px;
+  border-radius: 17px;
+  cursor: pointer;
+}
 .voice-toggle[aria-pressed="true"] { border-color: #a8d7c3; color: #338567; }
 .voice-button.listening { border-color: #d6bd80; background: #fcf8ed; color: #a27725; }
-.send-button { border-color: var(--shell-mint); border-radius: 7px; background: var(--shell-mint); color: #17372b; }
-.send-button:hover:not(:disabled) { background: #74ebc2; }
+.send-button {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #69d3b8;
+  color: #17372b;
+  font-size: 0;
+  box-shadow: 0 5px 14px rgba(57, 156, 125, 0.12);
+  transition: transform 180ms ease, background-color 180ms ease;
+}
+.send-button::after { content: "→"; font-size: 18px; line-height: 1; }
+.send-button:hover:not(:disabled) { transform: translateY(-2px); background: #74ebc2; }
 .pause-button { border-color: #d6bd80; background: #fcf8ed; color: #916c24; }
 .stop-button { border-color: #d8a2a2; background: #fff6f5; color: #b94d4d; }
 .voice-privacy, .voice-status { color: #858b85; }
@@ -2976,12 +2979,46 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
   border: 1px solid #dedfd8;
   border-radius: 17px;
   background: #f8f8f4;
+  cursor: pointer;
+  box-shadow: 0 0 0 rgba(56, 139, 110, 0);
+  transition:
+    transform 180ms ease,
+    border-color 180ms ease,
+    background-color 180ms ease,
+    box-shadow 180ms ease;
 }
 .capability-card:nth-child(odd) { border-right: 1px solid #dedfd8; }
-.capability-card:hover { border-color: #b8cfc2; background: #fbfbf7; }
-.capability-icon { width: 32px; height: 32px; border: 0; border-radius: 10px; background: #def5eb; color: #368b6e; font-size: 13px; }
+.capability-card:hover,
+.capability-card:focus-visible {
+  transform: translateY(-4px);
+  border-color: #94c9b5;
+  background: #fbfdf9;
+  box-shadow: 0 10px 24px rgba(73, 126, 105, 0.11);
+  outline: none;
+}
+.capability-icon {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 10px;
+  background: #def5eb;
+  color: #368b6e;
+  font-size: 13px;
+  transition:
+    transform 180ms ease,
+    background-color 180ms ease,
+    color 180ms ease;
+}
+.capability-card:hover .capability-icon,
+.capability-card:focus-visible .capability-icon {
+  transform: scale(1.07) rotate(-2deg);
+  background: #69d3b8;
+  color: #ffffff;
+}
 .capability-copy { gap: 5px; }
-.capability-copy strong { color: #343a35; font-size: 10px; }
+.capability-copy strong { color: #343a35; font-size: 10px; transition: color 180ms ease; }
+.capability-card:hover .capability-copy strong,
+.capability-card:focus-visible .capability-copy strong { color: #25775c; }
 .capability-copy small { color: #828982; font-size: 9px; }
 .capability-action { display: none; }
 
