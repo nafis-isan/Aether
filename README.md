@@ -1,6 +1,4 @@
 <div align="center">
-  <img src="./frontend/public/aether-monogram.png" alt="Aether icon" width="180" />
-  <br />
   <img src="./frontend/public/aether-wordmark.png" alt="Aether" width="720" />
 </div>
 
