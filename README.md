@@ -1,4 +1,8 @@
-# Aether
+<div align="center">
+  <img src="./frontend/public/aether-monogram.png" alt="Aether icon" width="180" />
+  <br />
+  <img src="./frontend/public/aether-wordmark.png" alt="Aether" width="720" />
+</div>
 
 Aether is a personal AI assistant built in phases according to `AETHER_MASTER_BLUEPRINT.md`.
 
