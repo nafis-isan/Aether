@@ -122,6 +122,8 @@ async def test_multi_step_goal_is_planned_and_uses_previous_step_result(client, 
         assert tool_events[1].payload["output"] == {"value": 5}
         assert "usage.updated" in event_types
         assert "dag.created" in event_types
+        assert "architecture.graph" in event_types
+        assert event_types.count("architecture.node") >= 3
         assert "subagent.started" in event_types
         assert "subagent.completed" in event_types
         artifacts = list(await session.scalars(select(Artifact).where(Artifact.agent_run_id == run.id)))

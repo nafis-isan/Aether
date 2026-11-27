@@ -13,7 +13,7 @@ This repository contains:
 - Local MySQL development using Laragon on `localhost:3306`
 - Account registration/login, owner-scoped conversations, and MySQL migrations
 - OpenRouter chat with general/coding models and server-side tool calls
-- Goal-oriented supervisor/planner/worker workflow with ordered plans, event progress, and MySQL recovery checkpoints
+- Goal-oriented LangGraph workflow with explicit orchestrator, memory, planning, tool, coding, research, and general-worker nodes; ordered plans, event progress, and MySQL recovery checkpoints. Plan steps execute sequentially.
 - Bounded model/tool execution with provider-reported cost checks and a cooperative run-stop endpoint
 - User-approved task creation, task APIs, and user-controlled memory
 - Authenticated WebSocket activity replay and reconnect
@@ -105,6 +105,14 @@ described by the `awwwards-mcp` package documentation. No API key is required.
 - Passwords use Argon2id hashing; chat messages and conversations are scoped to their owner in MySQL.
 - OpenRouter reasoning details are preserved server-side for model continuation and are not included in chat API responses.
 - The Nuxt homepage provides local single-user startup by default, plus account registration/login when local mode is disabled; it also includes conversation history, model selection, live agent activity, approval actions, and memory controls.
+- The chat workspace displays the selected run's agent architecture and activity, and supports keyboard shortcuts:
+  - `Enter` sends a message; `Shift+Enter` inserts a new line.
+  - `Ctrl/Cmd+K` searches conversations.
+  - `Ctrl/Cmd+Alt+N` starts a new conversation.
+  - `Ctrl/Cmd+Alt+P` opens Memory.
+  - `Ctrl/Cmd+L` focuses the message input.
+  - `Ctrl/Cmd+M` toggles spoken replies.
+  - `Ctrl/Cmd+/` opens the shortcut list; `Esc` closes the active dialog.
 
 ## Verification
 

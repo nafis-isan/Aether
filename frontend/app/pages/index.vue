@@ -85,6 +85,7 @@ const activityStatus = ref<'disconnected' | 'connecting' | 'connected'>('disconn
 const eventCursors = ref<Record<string, number>>({});
 const approvals = ref<Approval[]>([]);
 const approvalModalId = ref<string | null>(null);
+const showShortcutModal = ref(false);
 const memories = ref<Memory[]>([]);
 const artifacts = ref<Artifact[]>([]);
 const memoryContent = ref('');
@@ -172,7 +173,7 @@ const latestAssistantCitations = computed(() => {
     : [];
 });
 const conversationHistory = computed(() => {
-  if (streamedReply.value) {
+  if (busy.value && streamedReply.value) {
     return [
       ...messages.value,
       {
@@ -239,6 +240,15 @@ const currentDag = computed(() => {
     execution_mode?: string;
     parallel_supported?: boolean;
     nodes?: Array<{ id: string; label: string; status: string; agent: string }>;
+    edges?: Array<{ from: string; to: string }>;
+  } | undefined;
+});
+
+const currentArchitecture = computed(() => {
+  const event = currentRunEvents.value.find((item) => item.type === 'architecture.graph');
+  return event?.data as {
+    execution_mode?: string;
+    nodes?: Array<{ id: string; label: string; status: string }>;
     edges?: Array<{ from: string; to: string }>;
   } | undefined;
 });
@@ -928,6 +938,18 @@ function removeAttachment(): void {
   if (attachmentInput.value) attachmentInput.value.value = '';
 }
 
+function handleComposerKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Enter' || event.isComposing) return;
+  if (event.shiftKey) return;
+
+  event.preventDefault();
+  if (event.repeat) return;
+  if (isReadingAttachment.value) return;
+  if (!draft.value.trim() && !selectedAttachment.value) return;
+
+  void sendMessage();
+}
+
 async function sendMessage(): Promise<void> {
   const draftMessage = draft.value.trim();
   if (!draftMessage && !selectedAttachment.value) return;
@@ -942,6 +964,8 @@ async function sendMessage(): Promise<void> {
           : 'Dokumen tidak dapat dibaca sebagai teks.'
       ].join('\n')
     : draftMessage;
+  draft.value = '';
+  removeAttachment();
   if (isWorkflowPaused.value || (busy.value && isWorkflowActive.value)) {
     await redirectCurrentRun(message);
     return;
@@ -993,6 +1017,7 @@ async function sendMessage(): Promise<void> {
     activeConversationId.value = response.conversation_id;
     draft.value = '';
     removeAttachment();
+    streamedReply.value = '';
     await Promise.all([
       loadConversations(),
       openConversation(response.conversation_id),
@@ -1251,6 +1276,7 @@ function startNewTask(): void {
 function openConversationSearch(): void {
   activeSidebarSection.value = 'explore';
   conversationSearch.value = '';
+  workspaceView.value = 'chat';
   void nextTick(() => document.querySelector<HTMLInputElement>('.conversation-search input')?.focus());
 }
 
@@ -1317,6 +1343,37 @@ watch(conversationHistory, () => {
   });
 });
 watch([token, activeConversationId, localAuthMode], connectActivity);
+function handleGlobalShortcut(event: KeyboardEvent): void {
+  if (event.isComposing) return;
+  const modifier = event.ctrlKey || event.metaKey;
+
+  if (modifier && event.key.toLocaleLowerCase() === 'k') {
+    event.preventDefault();
+    openConversationSearch();
+  } else if (modifier && event.altKey && event.key.toLocaleLowerCase() === 'n') {
+    event.preventDefault();
+    startNewTask();
+  } else if (modifier && event.altKey && event.key.toLocaleLowerCase() === 'p') {
+    event.preventDefault();
+    openCollection();
+  } else if (modifier && event.key.toLocaleLowerCase() === 'l') {
+    event.preventDefault();
+    void nextTick(() => composerInput.value?.focus());
+  } else if (modifier && event.key === '/') {
+    event.preventDefault();
+    showShortcutModal.value = !showShortcutModal.value;
+  } else if (modifier && event.key.toLocaleLowerCase() === 'm') {
+    event.preventDefault();
+    toggleSpokenReplies();
+  } else if (event.key === 'Escape') {
+    if (showShortcutModal.value) {
+      showShortcutModal.value = false;
+    } else if (approvalModalId.value) {
+      approvalModalId.value = null;
+    }
+  }
+}
+
 onMounted(() => {
   const savedSidebarWidth = Number(localStorage.getItem('aether-sidebar-width'));
   if (savedSidebarWidth >= 220 && savedSidebarWidth <= 420) {
@@ -1324,9 +1381,11 @@ onMounted(() => {
   }
   initializeVoiceSupport();
   void initializeApplication();
+  window.addEventListener('keydown', handleGlobalShortcut);
 });
 onBeforeUnmount(() => {
   disconnectActivity();
+  window.removeEventListener('keydown', handleGlobalShortcut);
   window.removeEventListener('pointermove', resizeSidebar);
   document.body.style.cursor = '';
   document.body.style.userSelect = '';
@@ -1556,6 +1615,21 @@ onBeforeUnmount(() => {
                 </ol>
               </div>
 
+              <div v-if="currentArchitecture?.nodes?.length" class="architecture-view" aria-label="Aether agent architecture">
+                <p class="agent-list-label">AGENT ARCHITECTURE <span>LANGGRAPH</span></p>
+                <div class="architecture-grid">
+                  <article
+                    v-for="node in currentArchitecture.nodes"
+                    :key="node.id"
+                    :class="{ active: node.status === 'active' }"
+                  >
+                    <span class="architecture-node-dot" aria-hidden="true" />
+                    <strong>{{ node.label }}</strong>
+                    <small>{{ node.status === 'active' ? 'Active' : 'Available' }}</small>
+                  </article>
+                </div>
+              </div>
+
               <div v-if="currentActivityEvents.length" class="task-event-log" aria-label="Log aktivitas run">
                 <p class="agent-list-label">ACTIVITY LOG</p>
                 <ol>
@@ -1631,7 +1705,7 @@ onBeforeUnmount(() => {
                   rows="1"
                   aria-label="Tujuan task untuk Aether"
                   :placeholder="isWorkflowActive || isWorkflowPaused ? '> Tulis perubahan tujuan untuk mengalihkan run…' : '> Apa yang ingin Aether selesaikan?'"
-                  @keydown.enter.exact.prevent="sendMessage"
+                  @keydown="handleComposerKeydown"
                 />
                 <div v-if="selectedAttachment" class="attachment-chip" :class="{ reading: isReadingAttachment }">
                   <span class="attachment-chip-icon" aria-hidden="true">◆</span>
@@ -1850,6 +1924,38 @@ onBeforeUnmount(() => {
         @set-memory-active="setMemoryActive"
         @delete-memory="deleteMemory"
       />
+
+      <button
+        v-if="workspaceView === 'chat'"
+        class="shortcut-hint"
+        type="button"
+        :title="'Buka daftar shortcut (Ctrl+/)'"
+        @click="showShortcutModal = true"
+      >
+        <span>⌘ / Ctrl</span>
+        <kbd>/</kbd>
+      </button>
+
+      <div v-if="showShortcutModal" class="approval-overlay shortcut-overlay" role="presentation" @click.self="showShortcutModal = false">
+        <section class="shortcut-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcut-dialog-title">
+          <header>
+            <div>
+              <p class="eyebrow">KEYBOARD SHORTCUTS</p>
+              <h2 id="shortcut-dialog-title">Bekerja lebih cepat</h2>
+            </div>
+            <button type="button" aria-label="Tutup daftar shortcut" @click="showShortcutModal = false">×</button>
+          </header>
+          <div class="shortcut-list">
+            <div><span>Cari percakapan</span><span><kbd>Ctrl</kbd><kbd>K</kbd></span></div>
+            <div><span>Percakapan baru</span><span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>N</kbd></span></div>
+            <div><span>Buka Memory</span><span><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>P</kbd></span></div>
+            <div><span>Fokus ke kolom input</span><span><kbd>Ctrl</kbd><kbd>L</kbd></span></div>
+            <div><span>Aktifkan/matikan suara</span><span><kbd>Ctrl</kbd><kbd>M</kbd></span></div>
+            <div><span>Buka daftar shortcut</span><span><kbd>Ctrl</kbd><kbd>/</kbd></span></div>
+            <div><span>Tutup dialog</span><span><kbd>Esc</kbd></span></div>
+          </div>
+        </section>
+      </div>
 
       <div v-if="currentApprovalModal" class="approval-overlay" role="presentation" @click.self="dismissApprovalModal">
         <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-dialog-title">
@@ -3309,6 +3415,7 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .chat-active .task-timeline-pane > .run-summary,
 .chat-active .task-timeline-pane > .tool-activity,
 .chat-active .task-timeline-pane > .dag-view,
+.chat-active .task-timeline-pane > .architecture-view,
 .chat-active .task-timeline-pane > .task-event-log,
 .chat-active .task-timeline-pane > .timeline-empty,
 .chat-active .task-timeline-pane > .timeline-workers,
@@ -3462,6 +3569,26 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .dag-node-copy strong { color: #414841; font-size: 10px; }
 .dag-node-copy small { color: #858c85; font-size: 8px; }
 .dag-edge { color: #8e9690; text-align: center; }
+.architecture-view { margin-top: 18px; }
+.architecture-view > .agent-list-label { display: flex; justify-content: space-between; }
+.architecture-view > .agent-list-label span { color: #328d6d; }
+.architecture-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.architecture-grid article {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-height: 48px;
+  padding: 8px;
+  border: 1px solid #dce0d7;
+  border-radius: 10px;
+  background: #fafbf7;
+}
+.architecture-grid article strong { grid-column: 2; color: #414841; font-size: 9px; }
+.architecture-grid article small { grid-column: 2; color: #858c85; font-size: 8px; }
+.architecture-node-dot { grid-row: 1 / 3; width: 8px; height: 8px; border-radius: 50%; background: #b7bcb5; }
+.architecture-grid article.active .architecture-node-dot { background: #54e2b3; box-shadow: 0 0 0 3px #54e2b322; }
 .saved-artifacts details { padding: 9px 0; border-bottom: 1px solid #e0e1db; }
 .saved-artifacts summary { display: flex; gap: 8px; color: #444b45; cursor: pointer; font-size: 10px; }
 .artifact-preview { margin-top: 9px; }
@@ -3531,6 +3658,76 @@ body { background: var(--shell-paper); color: var(--shell-ink); }
 .approval-dialog-actions button { border-color: #d2d6cf; border-radius: 8px; color: #4e564f; }
 .approval-dialog-actions .approval-allow { border-color: #edc86f; background: #edc86f; color: #33280f; }
 .approval-dialog-actions .approval-deny:hover:not(:disabled) { border-color: #c46b6b; color: #b94d4d; }
+
+.shortcut-hint {
+  position: fixed;
+  z-index: 9;
+  right: 22px;
+  bottom: 18px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px 0 11px;
+  border: 1px solid #d6d9d1;
+  border-radius: 18px;
+  background: #fbfbf7;
+  color: #697169;
+  box-shadow: 0 8px 24px #252a2424;
+  font-size: 9px;
+}
+.shortcut-hint kbd,
+.shortcut-dialog kbd {
+  min-width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid #d4d7cf;
+  border-radius: 6px;
+  background: #f2f3ed;
+  color: #4e564f;
+  box-shadow: inset 0 -1px 0 #cfd2c8;
+  font-family: inherit;
+  font-size: 9px;
+}
+.shortcut-dialog {
+  width: min(460px, calc(100vw - 32px));
+  border: 1px solid #d7dad1;
+  border-radius: 18px;
+  background: #fbfbf7;
+  box-shadow: 0 24px 90px #20241f33;
+  overflow: hidden;
+}
+.shortcut-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 22px 22px 16px;
+  border-bottom: 1px solid #e1e3dc;
+}
+.shortcut-dialog header h2 { margin: 4px 0 0; color: #292e29; font-size: 20px; }
+.shortcut-dialog header button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid #d7dad1;
+  border-radius: 50%;
+  background: #fff;
+  color: #697169;
+}
+.shortcut-list { display: grid; padding: 8px 22px 16px; }
+.shortcut-list > div {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid #e7e8e2;
+  color: #4e564f;
+  font-size: 11px;
+}
+.shortcut-list > div:last-child { border-bottom: 0; }
+.shortcut-list > div > span:last-child { display: flex; gap: 5px; }
 
 @media (max-width: 1000px) {
   .workspace { grid-template-columns: var(--sidebar-width, 280px) minmax(0, 1fr); }

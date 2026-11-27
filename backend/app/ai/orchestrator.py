@@ -449,6 +449,30 @@ def build_workflow(
                 ],
             },
         )
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="aether_core",
+            event_type="architecture.graph",
+            payload={
+                "nodes": [
+                    {"id": "orchestrator", "label": "Orchestrator", "status": "active"},
+                    {"id": "planning", "label": "Planning Agent", "status": "active"},
+                    {"id": "coding", "label": "Coding Agent", "status": "active" if agent == "developer" else "available"},
+                    {"id": "research", "label": "Research Agent", "status": "active" if agent == "researcher" else "available"},
+                    {"id": "memory", "label": "Memory System", "status": "active"},
+                    {"id": "tools", "label": "Tool System", "status": "active"},
+                ],
+                "edges": [
+                    {"from": "orchestrator", "to": "planning"},
+                    {"from": "orchestrator", "to": "memory"},
+                    {"from": "orchestrator", "to": "tools"},
+                    {"from": "planning", "to": "coding"},
+                    {"from": "planning", "to": "research"},
+                ],
+                "execution_mode": "sequential",
+            },
+        )
         return planned_state
 
     async def worker(state: WorkflowState) -> WorkflowState:
@@ -833,18 +857,112 @@ def build_workflow(
         )
         return result
 
+    async def memory_system(state: WorkflowState) -> WorkflowState:
+        memories = list(state.get("memories", []))
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="memory_system",
+            event_type="architecture.node",
+            payload={
+                "node": "memory",
+                "status": "ready",
+                "memory_count": len(memories),
+            },
+        )
+        return state
+
+    async def planning_agent(state: WorkflowState) -> WorkflowState:
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="planning_agent",
+            event_type="architecture.node",
+            payload={"node": "planning", "status": "ready"},
+        )
+        return await planner(state)
+
+    async def tool_system(state: WorkflowState) -> WorkflowState:
+        agent = state["selected_agent"]
+        available_tools = [item["function"]["name"] for item in tool_definitions_for(agent)]
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="tool_system",
+            event_type="architecture.node",
+            payload={
+                "node": "tools",
+                "status": "ready",
+                "tools": available_tools,
+            },
+        )
+        return state
+
+    async def coding_agent(state: WorkflowState) -> WorkflowState:
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="coding_agent",
+            event_type="architecture.node",
+            payload={"node": "coding", "status": "working"},
+        )
+        return await worker(state)
+
+    async def research_agent(state: WorkflowState) -> WorkflowState:
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name="research_agent",
+            event_type="architecture.node",
+            payload={"node": "research", "status": "working"},
+        )
+        return await worker(state)
+
+    async def general_worker(state: WorkflowState) -> WorkflowState:
+        agent = state["selected_agent"]
+        await emit_event(
+            session,
+            run_id=state["run_id"],
+            agent_name=f"{agent}_agent",
+            event_type="architecture.node",
+            payload={"node": agent, "status": "working"},
+        )
+        return await worker(state)
+
     graph = StateGraph(WorkflowState)
     graph.add_node("supervisor", supervisor)
-    graph.add_node("planner", planner)
-    graph.add_node("worker", worker)
+    graph.add_node("memory_system", memory_system)
+    graph.add_node("planning_agent", planning_agent)
+    graph.add_node("tool_system", tool_system)
+    graph.add_node("coding_agent", coding_agent)
+    graph.add_node("research_agent", research_agent)
+    graph.add_node("general_worker", general_worker)
     graph.add_conditional_edges(
         START,
-        lambda state: "worker" if state.get("plan") else "supervisor",
-        {"supervisor": "supervisor", "worker": "worker"},
+        lambda state: "tool_system" if state.get("plan") else "supervisor",
+        {"supervisor": "supervisor", "tool_system": "tool_system"},
     )
-    graph.add_edge("supervisor", "planner")
-    graph.add_edge("planner", "worker")
-    graph.add_edge("worker", END)
+    graph.add_edge("supervisor", "memory_system")
+    graph.add_edge("memory_system", "planning_agent")
+    graph.add_edge("planning_agent", "tool_system")
+    graph.add_conditional_edges(
+        "tool_system",
+        lambda state: (
+            "coding_agent"
+            if state.get("selected_agent") == "developer"
+            else "research_agent"
+            if state.get("selected_agent") == "researcher"
+            else "general_worker"
+        ),
+        {
+            "coding_agent": "coding_agent",
+            "research_agent": "research_agent",
+            "general_worker": "general_worker",
+        },
+    )
+    graph.add_edge("coding_agent", END)
+    graph.add_edge("research_agent", END)
+    graph.add_edge("general_worker", END)
     return graph.compile()
 
 
